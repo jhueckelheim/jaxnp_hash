@@ -32,6 +32,9 @@ def hash_popf(name):
         raise Exception(f"Unexpected operation in Hash, expected {name} but got {namep}.")
     return val
 
+def flatten_hash():
+    return [vv for funcname, funchash in path_hash for vv in jnp.atleast_1d(funchash)]
+
 # Wrapper class for JAX tensors
 class HashTensor:
     def __init__(self, value):

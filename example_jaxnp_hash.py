@@ -10,5 +10,7 @@ def myfunc(x, mode):
 myfunc_g = jax.value_and_grad(myfunc)
 
 print(myfunc_g(jnp.array([1.0, 2.0, -3.0]), "record"))
+print(jnph.flatten_hash())
 print(myfunc_g(jnp.array([1.0, 17.0, 5.0]), "replay"))
 print(myfunc_g(jnp.array([1.0, 17.0, 7.0]), "consume"))
+
