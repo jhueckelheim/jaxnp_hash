@@ -3,37 +3,42 @@ import jax.numpy as jnp
 
 is_recording = False
 path_hash = []
+tolerance = 0
+path_hash_pos = 0
 
 @contextmanager
-def hash_mode(mode = None):
+def hash_mode(mode = None, tol = 0):
     global is_recording
     global path_hash
+    global path_hash_pos
+    global tolerance
     if(mode == "record"):
         is_recording = True
         path_hash = []
-    elif(mode == "consume"):
-        is_recording = False
+        path_hash_pos = 0
+        tolerance = tol
     elif(mode == "replay"):
         is_recording = False
-        old_hash = path_hash.copy()
+        path_hash_pos = 0
     else:
         raise Exception(f"Unexpected hash recording mode {mode}.")
     yield
     is_recording = False
-    if(mode == "replay"):
-        path_hash = old_hash
 
-def hash_append(name, val):
-    path_hash.append((name, val))
+def hash_append(name, choices):
+    global path_hash
+    global path_hash_pos
+    path_hash.append(_TraceNode(name, choices))
+    path_hash_pos += 1
 
 def hash_popf(name):
-    namep, val = path_hash.pop(0)
-    if(namep != name):
-        raise Exception(f"Unexpected operation in Hash, expected {name} but got {namep}.")
-    return val
-
-def flatten_hash():
-    return [vv for funcname, funchash in path_hash for vv in jnp.atleast_1d(funchash)]
+    global path_hash
+    global path_hash_pos
+    node = path_hash[path_hash_pos]
+    path_hash_pos += 1
+    if(node.name != name):
+        raise Exception(f"Unexpected operation in Hash, expected {name} but got {node.name}.")
+    return node.currentChoice()
 
 # Wrapper class for JAX tensors
 class HashTensor:
@@ -52,34 +57,74 @@ class HashTensor:
     def __mul__(self, other):
         return HashTensor(self.value * other.value)
 
+class _TraceNode:
+    def __init__(self, name, choices):
+        self.num = len(choices)
+        self.pos = 0
+        self.choices = choices
+        self.name = name
+
+    def currentChoice(self):
+        return self.choices[self.pos]
+
+    def incrementChoice(self):
+        if(self.pos + 1 >= self.num):
+            self.pos = 0
+            return False
+        else:
+            self.pos += 1
+            return True
+
+def next_hash():
+    for i in reversed(range(len(path_hash))):
+        if(path_hash[i].incrementChoice()):
+            return True
+    return False
+
 def max(inval):
     if(is_recording):
         loc = jnp.argmax(inval.value)
-        hash_append("argmax", loc)
+        val = inval.value[loc]
+        nearby_locs, = jnp.where(inval.value >= val - tolerance)
+        hash_append("max", nearby_locs)
     else:
-        loc = hash_popf("argmax")
-    return HashTensor(inval.value[loc])
+        loc = hash_popf("max")
+        val = inval.value[loc]
+    return HashTensor(val)
 
 def maximum(one, two):
     if(is_recording):
         loc = one.value >= two.value
-        hash_append("maximum", loc)
+        hash_append("maximum", [loc,])
     else:
         loc = hash_popf("maximum")
     return HashTensor(jnp.where(loc, one.value, two.value))
 
+#def quantile(vals, n):
+
 def min(inval):
     if(is_recording):
         loc = jnp.argmax(inval.value)
-        hash_append("argmin", loc)
+        hash_append("min", [loc,])
     else:
-        loc = hash_popf("argmin")
+        loc = hash_popf("min")
     return HashTensor(inval.value[loc])
+
+def min(inval):
+    if(is_recording):
+        loc = jnp.argmin(inval.value)
+        val = inval.value[loc]
+        nearby_locs, = jnp.where(inval.value <= val + tolerance)
+        hash_append("min", nearby_locs)
+    else:
+        loc = hash_popf("min")
+        val = inval.value[loc]
+    return HashTensor(val)
 
 def minimum(one, two):
     if(is_recording):
         loc = one.value <= two.value
-        hash_append("minimum", loc)
+        hash_append("minimum", [loc,])
     else:
         loc = hash_popf("minimum")
     return HashTensor(jnp.where(loc, one.value, two.value))
@@ -90,7 +135,7 @@ def sum(inval):
 def abs(inval):
     if(is_recording):
         loc = inval.value >= 0
-        hash_append("abs", loc)
+        hash_append("abs", [loc,])
     else:
         loc = hash_popf("abs")
     return HashTensor(jnp.where(loc, inval.value, -inval.value))
