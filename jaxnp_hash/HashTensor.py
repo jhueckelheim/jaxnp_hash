@@ -533,8 +533,8 @@ class HashTensor:
         logger.debug(f"HashTensor.__mul__: self={self.value}, other={other.value}")
         return HashTensor(self.value * other.value)
 
-    def __div__(self, other):
-        logger.debug(f"HashTensor.__div__: self={self.value}, other={other.value}")
+    def __truediv__(self, other):
+        logger.debug(f"HashTensor.__truediv__: self={self.value}, other={other.value}")
         return HashTensor(self.value / other.value)
 
 class _TraceNode:
