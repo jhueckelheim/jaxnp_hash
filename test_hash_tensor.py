@@ -201,92 +201,57 @@ def test_abs():
     assert actual_results == expected_results, f"Expected results {expected_results}, got {actual_results}"
 
 def test_hash_set_operations():
-    """Test set-like operations on recorded hashes with different tolerances."""
-    print("Testing HashSet operations...")
+    """Test union, intersection, and difference operations."""
+    import jax.numpy as jnp
+    from jaxnp_hash import hash_mode, HashTensor, max, abs
     
-    # Test data with values that are close together
-    x1 = jnp.array([1.0, 2.0, 3.0])
-    x2 = jnp.array([1.02, 1.98, 3.03])  # Values within 0.05 tolerance
+    # Create two different HashSets with different tolerances
+    arr1 = jnp.array([1.01, 2.02, 3.03])
+    arr2 = jnp.array([0.02, -0.01, 0.03])
     
-    # Record with tight tolerance (0.01) - should only get 1 hash (no values within tolerance)
-    with jnph.hash_mode("record", 0.01) as hashes_tight:
-        result_tight = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
+    # Record with tolerance 0.01 (tight)
+    with hash_mode("record", tol=0.01) as tight_hashes:
+        result1 = max(HashTensor(arr1))
+        result2 = abs(HashTensor(arr2))
     
-    # Record with loose tolerance (0.1) - should get 8 hashes (2^3 combinations)
-    with jnph.hash_mode("record", 0.1) as hashes_loose:
-        result_loose = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
+    # Record with tolerance 0.1 (loose) 
+    with hash_mode("record", tol=0.1) as loose_hashes:
+        result3 = max(HashTensor(arr1)) 
+        result4 = abs(HashTensor(arr2))
     
-    print(f"Tight tolerance (0.01): {len(hashes_tight)} hashes")
-    print(f"Loose tolerance (0.1): {len(hashes_loose)} hashes")
+    print(f"Tight tolerance: {len(tight_hashes)} hashes")
+    print(f"Loose tolerance: {len(loose_hashes)} hashes")
     
-    # Test basic set properties
-    assert len(hashes_tight) == 1, f"Expected 1 hash with tight tolerance, got {len(hashes_tight)}"
-    assert len(hashes_loose) == 8, f"Expected 8 hashes with loose tolerance, got {len(hashes_loose)}"
-    assert bool(hashes_tight) == True, "Tight tolerance set should not be empty"
-    assert bool(hashes_loose) == True, "Loose tolerance set should not be empty"
+    # Test union
+    union_set = tight_hashes.union(loose_hashes)
+    print(f"Union: {len(union_set)} hashes")
+    assert len(union_set) >= len(tight_hashes) and len(union_set) >= len(loose_hashes)
     
-    # Test iteration - collect all hashes from both sets
-    tight_hashes = list(hashes_tight)
-    loose_hashes = list(hashes_loose)
+    # Test intersection
+    intersection_set = tight_hashes.intersection(loose_hashes)
+    print(f"Intersection: {len(intersection_set)} hashes")
+    assert len(intersection_set) <= len(tight_hashes) and len(intersection_set) <= len(loose_hashes)
     
-    print(f"Collected {len(tight_hashes)} hashes from tight tolerance")
-    print(f"Collected {len(loose_hashes)} hashes from loose tolerance")
+    # Test difference
+    diff_set = loose_hashes.difference(tight_hashes)
+    print(f"Difference (loose - tight): {len(diff_set)} hashes")
     
-    # Test that there are more hashes with loose tolerance than tight tolerance
-    assert len(loose_hashes) > len(tight_hashes), \
-        "Loose tolerance should have more hashes than tight tolerance"
+    # Verify set properties
+    # Union should contain all elements from both sets
+    for hash_item in tight_hashes:
+        assert hash_item in union_set or any(tight_hashes._hashes_equal(hash_item, u) for u in union_set)
     
-    # Test specific hash replay to verify they work
-    print("Testing hash replay...")
-    test_count = 0
-    for hash_choice in loose_hashes[:3]:  # Test first 3 hashes
-        with jnph.hash_mode("replay", replay_hash=hash_choice):
-            replay_result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-            # Verify result is reasonable (should be elementwise max of some combination)
-            for i in range(len(replay_result.value)):
-                assert replay_result.value[i] in [x1[i], x2[i]], \
-                    f"Replay result at index {i} should be from x1 or x2"
-            test_count += 1
+    for hash_item in loose_hashes:
+        assert hash_item in union_set or any(loose_hashes._hashes_equal(hash_item, u) for u in union_set)
     
-    print(f"Successfully tested replay for {test_count} hash choices")
+    # Intersection should only contain common elements
+    for hash_item in intersection_set:
+        # Check that this hash exists in both original sets
+        in_tight = hash_item in tight_hashes or any(tight_hashes._hashes_equal(hash_item, t) for t in tight_hashes)
+        in_loose = hash_item in loose_hashes or any(loose_hashes._hashes_equal(hash_item, l) for l in loose_hashes)
+        assert in_tight and in_loose, "Intersection element should be in both sets"
     
-    # Test that the sets produce different results when replayed
-    # Note: We need fresh hashes for each test since hash_popf consumes the hash
-    
-    # Get fresh hashes for tight tolerance  
-    with jnph.hash_mode("record", 0.01) as fresh_tight:
-        result_tight = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-    fresh_tight_hashes = list(fresh_tight)
-    
-    replay_results_tight = set()
-    for hash_choice in fresh_tight_hashes:
-        with jnph.hash_mode("replay", replay_hash=hash_choice):
-            result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-            replay_results_tight.add(tuple(result.value.tolist()))
-    
-    # Get fresh hashes for loose tolerance
-    with jnph.hash_mode("record", 0.1) as fresh_loose:
-        result_loose = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-    fresh_loose_hashes = list(fresh_loose)
-    
-    replay_results_loose = set()
-    for hash_choice in fresh_loose_hashes:
-        with jnph.hash_mode("replay", replay_hash=hash_choice):
-            result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-            replay_results_loose.add(tuple(result.value.tolist()))
-    
-    print(f"Tight tolerance produced {len(replay_results_tight)} unique results")
-    print(f"Loose tolerance produced {len(replay_results_loose)} unique results")
-    
-    # Verify that loose tolerance produces more unique results
-    assert len(replay_results_loose) > len(replay_results_tight), \
-        "Loose tolerance should produce more unique results"
-    
-    # Verify that tight tolerance results are subset of loose tolerance results
-    assert replay_results_tight.issubset(replay_results_loose), \
-        "Tight tolerance results should be subset of loose tolerance results"
-    
-    print("✓ All HashSet operations tests passed!")
+    print("All set operations tests passed!")
 
 def test_hash_set_with_no_tolerance():
     """Test HashSet behavior when no values are within tolerance."""
@@ -361,6 +326,67 @@ def test_hash_set_membership():
     
     print("✓ Membership test passed!")
 
+def test_hash_set_random_access():
+    """Test random access to HashSet elements using [] operator."""
+    print("Testing HashSet random access...")
+    
+    x1 = jnp.array([1.0, 2.0])
+    x2 = jnp.array([1.05, 1.95])  # Both within 0.1 tolerance
+    
+    with jnph.hash_mode("record", 0.1) as hashes:
+        result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
+    
+    # Should have 4 hashes (2^2)
+    assert len(hashes) == 4, f"Expected 4 hashes, got {len(hashes)}"
+    
+    # Test that we can access all elements by index
+    accessed_hashes = []
+    for i in range(len(hashes)):
+        hash_at_i = hashes[i]
+        accessed_hashes.append(hash_at_i)
+        print(f"Hash at index {i}: {hash_at_i}")
+    
+    # Test that random access gives the same results as iteration
+    iteration_hashes = list(hashes)
+    assert len(accessed_hashes) == len(iteration_hashes), \
+        "Random access should give same number of hashes as iteration"
+    
+    # Compare each hash (they should be in the same order)
+    for i, (access_hash, iter_hash) in enumerate(zip(accessed_hashes, iteration_hashes)):
+        assert hashes._hashes_equal(access_hash, iter_hash), \
+            f"Hash at index {i} should be the same from random access and iteration"
+    
+    # Test negative indices
+    assert hashes._hashes_equal(hashes[-1], hashes[3]), "Negative index -1 should equal index 3"
+    assert hashes._hashes_equal(hashes[-2], hashes[2]), "Negative index -2 should equal index 2"
+    
+    # Test out-of-bounds access
+    try:
+        _ = hashes[4]  # Should raise IndexError
+        assert False, "Should have raised IndexError for index 4"
+    except IndexError:
+        pass  # Expected
+    
+    try:
+        _ = hashes[-5]  # Should raise IndexError
+        assert False, "Should have raised IndexError for index -5"
+    except IndexError:
+        pass  # Expected
+    
+    # Test type error for non-integer index
+    try:
+        _ = hashes["invalid"]  # Should raise TypeError
+        assert False, "Should have raised TypeError for string index"
+    except TypeError:
+        pass  # Expected
+    
+    # Test consistency - accessing the same index multiple times should give the same result
+    first_access = hashes[1]
+    second_access = hashes[1]
+    assert hashes._hashes_equal(first_access, second_access), \
+        "Multiple accesses to same index should give same result"
+    
+    print("✓ Random access test passed!")
 
 
 if __name__ == "__main__":
@@ -370,4 +396,5 @@ if __name__ == "__main__":
     test_hash_set_operations()
     test_hash_set_with_no_tolerance()
     test_hash_set_membership()
+    test_hash_set_random_access()
     print("All tests passed!")

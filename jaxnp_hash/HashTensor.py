@@ -52,6 +52,42 @@ class HashSet:
             total *= node.num
         return total
     
+    def __getitem__(self, index):
+        """Get hash at specific index using random access."""
+        if not isinstance(index, int):
+            raise TypeError("Index must be an integer")
+        
+        total_len = len(self)
+        if index < 0:
+            index = total_len + index  # Handle negative indices
+        
+        if index < 0 or index >= total_len:
+            raise IndexError(f"Index {index} is out of range for HashSet with {total_len} elements")
+        
+        # Convert index to combination of choices using mixed-radix representation
+        # Create a copy of the trace to avoid modifying the original
+        trace_copy = [_TraceNode(node.name, node.choices) for node in self.trace]
+        
+        # Reset all nodes to initial position
+        for node in trace_copy:
+            node.pos = 0
+        
+        # Calculate the position for each node based on the index
+        remaining_index = index
+        for i in reversed(range(len(trace_copy))):
+            node = trace_copy[i]
+            # Calculate how many combinations come after this node
+            combinations_after = 1
+            for j in range(i + 1, len(trace_copy)):
+                combinations_after *= trace_copy[j].num
+            
+            # Set this node's position
+            node.pos = remaining_index // combinations_after
+            remaining_index = remaining_index % combinations_after
+        
+        # Return the hash for this combination (using the copy)
+        return [_TraceNode(node.name, [node.currentChoice()]) for node in trace_copy]
+    
     def __contains__(self, item):
         """Check if a specific hash exists in the set."""
         if not isinstance(item, list) or len(item) != len(self.trace):
@@ -69,9 +105,32 @@ class HashSet:
             return False
         
         for node1, node2 in zip(hash1, hash2):
-            if (node1.name != node2.name or 
-                len(node1.choices) != 1 or len(node2.choices) != 1 or
-                not jnp.array_equal(node1.choices[0], node2.choices[0])):
+            if node1.name != node2.name:
+                return False
+            if len(node1.choices) != 1 or len(node2.choices) != 1:
+                return False
+            
+            choice1 = node1.choices[0]
+            choice2 = node2.choices[0]
+            
+            # Handle tuple choices (e.g., from maximum operation)
+            if isinstance(choice1, tuple) and isinstance(choice2, tuple):
+                if len(choice1) != len(choice2):
+                    return False
+                for c1, c2 in zip(choice1, choice2):
+                    if hasattr(c1, 'shape') and hasattr(c2, 'shape'):
+                        # Both are JAX arrays
+                        if not jnp.array_equal(c1, c2):
+                            return False
+                    elif c1 != c2:
+                        # Other values
+                        return False
+            # Handle JAX arrays
+            elif hasattr(choice1, 'shape') and hasattr(choice2, 'shape'):
+                if not jnp.array_equal(choice1, choice2):
+                    return False
+            # Handle other values
+            elif choice1 != choice2:
                 return False
         return True
     
@@ -87,16 +146,138 @@ class HashSet:
     
     # Additional set-like methods
     def union(self, other):
-        """Return union with another HashSet (not implemented - would be complex)."""
-        raise NotImplementedError("Union operation not implemented for HashSet")
+        """Return union with another HashSet."""
+        if not isinstance(other, HashSet):
+            raise TypeError("Union requires another HashSet")
+        
+        # Create a new HashSet from the combined unique hashes
+        all_hashes = set()
+        
+        # Add all hashes from self
+        for hash_item in self:
+            all_hashes.add(self._hash_to_tuple(hash_item))
+        
+        # Add all hashes from other
+        for hash_item in other:
+            all_hashes.add(self._hash_to_tuple(hash_item))
+        
+        # Convert back to trace format
+        combined_trace = self._create_trace_from_hashes(list(all_hashes))
+        return HashSet(combined_trace)
     
     def intersection(self, other):
-        """Return intersection with another HashSet (not implemented - would be complex).""" 
-        raise NotImplementedError("Intersection operation not implemented for HashSet")
+        """Return intersection with another HashSet."""
+        if not isinstance(other, HashSet):
+            raise TypeError("Intersection requires another HashSet")
+        
+        # Find common hashes
+        common_hashes = set()
+        other_hashes = set()
+        
+        # Get all hashes from other
+        for hash_item in other:
+            other_hashes.add(self._hash_to_tuple(hash_item))
+        
+        # Find hashes in self that are also in other
+        for hash_item in self:
+            hash_tuple = self._hash_to_tuple(hash_item)
+            if hash_tuple in other_hashes:
+                common_hashes.add(hash_tuple)
+        
+        # Convert back to trace format
+        common_trace = self._create_trace_from_hashes(list(common_hashes))
+        return HashSet(common_trace)
     
     def difference(self, other):
-        """Return difference with another HashSet (not implemented - would be complex)."""
-        raise NotImplementedError("Difference operation not implemented for HashSet")
+        """Return difference with another HashSet (hashes in self but not in other)."""
+        if not isinstance(other, HashSet):
+            raise TypeError("Difference requires another HashSet")
+        
+        # Find hashes in self but not in other
+        diff_hashes = set()
+        other_hashes = set()
+        
+        # Get all hashes from other
+        for hash_item in other:
+            other_hashes.add(self._hash_to_tuple(hash_item))
+        
+        # Find hashes in self that are not in other
+        for hash_item in self:
+            hash_tuple = self._hash_to_tuple(hash_item)
+            if hash_tuple not in other_hashes:
+                diff_hashes.add(hash_tuple)
+        
+        # Convert back to trace format
+        diff_trace = self._create_trace_from_hashes(list(diff_hashes))
+        return HashSet(diff_trace)
+    
+    def _hash_to_tuple(self, hash_item):
+        """Convert a hash (list of _TraceNode objects) to a hashable tuple."""
+        elements = []
+        for node in hash_item:
+            choice = node.choices[0]
+            
+            # Convert JAX arrays to Python values for hashing
+            if hasattr(choice, 'tolist'):
+                # JAX array or numpy array
+                try:
+                    elements.append((node.name, tuple(choice.tolist()) if hasattr(choice.tolist(), '__iter__') else choice.tolist()))
+                except:
+                    elements.append((node.name, float(choice)))
+            elif isinstance(choice, tuple):
+                # Tuple (e.g., from maximum operation)
+                try:
+                    nearby_indices, choice_int = choice
+                    nearby_tuple = tuple(nearby_indices.tolist()) if hasattr(nearby_indices, 'tolist') else tuple(nearby_indices)
+                    elements.append((node.name, (nearby_tuple, int(choice_int))))
+                except:
+                    elements.append((node.name, choice))
+            else:
+                # Regular Python value
+                elements.append((node.name, choice))
+        
+        return tuple(elements)
+    
+    def _create_trace_from_hashes(self, hash_tuples):
+        """Create a trace from a list of hash tuples."""
+        if not hash_tuples:
+            return []
+        
+        # Group choices by node name/position
+        node_choices = {}
+        for hash_tuple in hash_tuples:
+            for i, (node_name, choice) in enumerate(hash_tuple):
+                if i not in node_choices:
+                    node_choices[i] = {'name': node_name, 'choices': set()}
+                node_choices[i]['choices'].add(choice)
+        
+        # Create trace nodes
+        trace = []
+        for i in sorted(node_choices.keys()):
+            node_info = node_choices[i]
+            choices_list = list(node_info['choices'])
+            
+            # Convert back from tuple format to original format
+            converted_choices = []
+            for choice in choices_list:
+                if isinstance(choice, tuple) and len(choice) == 2 and isinstance(choice[0], tuple):
+                    # This is a tuple from maximum operation
+                    nearby_indices, choice_int = choice
+                    nearby_array = jnp.array(nearby_indices)
+                    converted_choices.append((nearby_array, choice_int))
+                elif isinstance(choice, tuple):
+                    # This is a regular tuple/array
+                    try:
+                        converted_choices.append(jnp.array(choice))
+                    except:
+                        converted_choices.append(choice)
+                else:
+                    # Regular value
+                    converted_choices.append(choice)
+            
+            trace.append(_TraceNode(node_info['name'], converted_choices))
+        
+        return trace
     
     def format_hash_choice(self, hash_choice):
         """Format a hash choice (list of _TraceNode objects) for display."""
@@ -181,16 +362,17 @@ class HashModeResult:
             return total
         return len(self._hash_set)
     
-    def _update_trace(self, trace):
-        """Update the trace during recording."""
-        self._trace = trace
-    
-    def __iter__(self):
-        """Iterate through the HashSet."""
+    def __getitem__(self, index):
+        """Get hash at specific index using random access."""
         if self._is_recording:
-            # During recording, return empty iterator
-            return iter([])
-        return iter(self._hash_set)
+            raise RuntimeError("Cannot perform random access during recording")
+        return self._hash_set[index]
+    
+    def _hashes_equal(self, hash1, hash2):
+        """Check if two hashes are equal."""
+        if self._is_recording:
+            raise RuntimeError("Cannot compare hashes during recording")
+        return self._hash_set._hashes_equal(hash1, hash2)
     
     def __contains__(self, item):
         """Check if item is in the HashSet."""
@@ -220,7 +402,46 @@ class HashModeResult:
             return "Cannot format hash choice during recording"
         return self._hash_set.format_hash_choice(hash_choice)
     
-
+    def union(self, other):
+        """Return union with another HashSet or HashModeResult."""
+        if self._is_recording:
+            raise RuntimeError("Cannot perform union operation during recording")
+        if isinstance(other, HashModeResult):
+            if other._is_recording:
+                raise RuntimeError("Cannot perform union with HashModeResult that is still recording")
+            other = other._hash_set
+        return self._hash_set.union(other)
+    
+    def intersection(self, other):
+        """Return intersection with another HashSet or HashModeResult."""
+        if self._is_recording:
+            raise RuntimeError("Cannot perform intersection operation during recording")
+        if isinstance(other, HashModeResult):
+            if other._is_recording:
+                raise RuntimeError("Cannot perform intersection with HashModeResult that is still recording")
+            other = other._hash_set
+        return self._hash_set.intersection(other)
+    
+    def difference(self, other):
+        """Return difference with another HashSet or HashModeResult."""
+        if self._is_recording:
+            raise RuntimeError("Cannot perform difference operation during recording")
+        if isinstance(other, HashModeResult):
+            if other._is_recording:
+                raise RuntimeError("Cannot perform difference with HashModeResult that is still recording")
+            other = other._hash_set
+        return self._hash_set.difference(other)
+    
+    def _update_trace(self, trace):
+        """Update the trace during recording."""
+        self._trace = trace
+    
+    def __iter__(self):
+        """Iterate through the HashSet."""
+        if self._is_recording:
+            # During recording, return empty iterator
+            return iter([])
+        return iter(self._hash_set)
 
 @contextmanager 
 def hash_mode(mode=None, tol=0, replay_hash=None):
@@ -339,8 +560,6 @@ class _TraceNode:
         else:
             self.pos += 1
             return True
-
-
 
 def max(inval):
     logger.debug(f"max: input={inval.value}")
