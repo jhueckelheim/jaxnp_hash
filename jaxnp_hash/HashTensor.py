@@ -410,7 +410,16 @@ class HashModeResult:
             if other._is_recording:
                 raise RuntimeError("Cannot perform union with HashModeResult that is still recording")
             other = other._hash_set
-        return self._hash_set.union(other)
+        
+        # Get the union as a HashSet
+        union_hash_set = self._hash_set.union(other)
+        
+        # Create a new HashModeResult and wrap the union HashSet
+        result = HashModeResult()
+        result._trace = union_hash_set.trace
+        result._hash_set = union_hash_set
+        result._is_recording = False
+        return result
     
     def intersection(self, other):
         """Return intersection with another HashSet or HashModeResult."""
@@ -420,7 +429,16 @@ class HashModeResult:
             if other._is_recording:
                 raise RuntimeError("Cannot perform intersection with HashModeResult that is still recording")
             other = other._hash_set
-        return self._hash_set.intersection(other)
+        
+        # Get the intersection as a HashSet
+        intersection_hash_set = self._hash_set.intersection(other)
+        
+        # Create a new HashModeResult and wrap the intersection HashSet
+        result = HashModeResult()
+        result._trace = intersection_hash_set.trace
+        result._hash_set = intersection_hash_set
+        result._is_recording = False
+        return result
     
     def difference(self, other):
         """Return difference with another HashSet or HashModeResult."""
@@ -430,7 +448,16 @@ class HashModeResult:
             if other._is_recording:
                 raise RuntimeError("Cannot perform difference with HashModeResult that is still recording")
             other = other._hash_set
-        return self._hash_set.difference(other)
+        
+        # Get the difference as a HashSet
+        difference_hash_set = self._hash_set.difference(other)
+        
+        # Create a new HashModeResult and wrap the difference HashSet
+        result = HashModeResult()
+        result._trace = difference_hash_set.trace
+        result._hash_set = difference_hash_set
+        result._is_recording = False
+        return result
     
     def _update_trace(self, trace):
         """Update the trace during recording."""
