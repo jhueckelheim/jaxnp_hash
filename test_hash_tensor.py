@@ -3,400 +3,577 @@ from itertools import product
 import jax
 import jax.numpy as jnp
 import jaxnp_hash as jnph
+import jaxnp_hash.numpy as jnph_np
 
 
 def test_maximum():
-    # Test case 1: No values within tolerance
     x1 = jnp.array([1.0, 2.0, 2.5])
     x2 = jnp.array([0.5, 1.5, 3.0])
 
-    # Record mode
-    with jnph.hash_mode("record", 0.1) as hashes:
-        result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-        assert jnp.allclose(result.value, jnp.array([1.0, 2.0, 3.0])), f"Expected [1.0, 2.0, 3.0], got {result.value}"
-        assert len(hashes) == 1  # One hash for original execution path
+    def f(x, y):
+        return jnph_np.maximum(x, y)
 
-    # Replay mode
-    with jnph.hash_mode("replay", replay_hash=hashes):
-        result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-        assert jnp.allclose(result.value, jnp.array([1.0, 2.0, 3.0])), f"Expected [1.0, 2.0, 3.0], got {result.value}"
+    val, paths = jnph.record(f, tol=0.1)(x1, x2)
+    assert jnp.allclose(val, jnp.array([1.0, 2.0, 3.0])), f"Expected [1.0, 2.0, 3.0], got {val}"
+    assert len(paths) == 1
 
-    # Test case 2: One value within tolerance
-    x1 = jnp.array([1.0, 2.0, 2.5])
-    x2 = jnp.array([0.95, 1.5, 3.0])  # 0.95 is within 0.1 of 1.0
+    replayed = jnph.replay(f, paths[0])(x1, x2)
+    assert jnp.allclose(replayed, jnp.array([1.0, 2.0, 3.0])), f"Expected [1.0, 2.0, 3.0], got {replayed}"
 
-    # Record mode
-    with jnph.hash_mode("record", 0.1) as hashes:
-        result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-        assert jnp.allclose(result.value[1:], jnp.array([2.0, 3.0])), f"Expected [2.0, 3.0] for indices 1:3, got {result.value[1:]}"
-        assert result.value[0] in [1.0, 0.95], f"Expected first value to be 1.0 or 0.95, got {result.value[0]}"
+    x2b = jnp.array([0.95, 1.5, 3.0])
 
-        assert len(hashes) == 2, f"Expected 2 hashes, got {len(hashes)} hashes"  # One hash for original execution path, one for the value within tolerance
+    val, paths = jnph.record(f, tol=0.1)(x1, x2b)
+    assert jnp.allclose(val[1:], jnp.array([2.0, 3.0]))
+    assert val[0] in [1.0, 0.95], f"Expected first value to be 1.0 or 0.95, got {val[0]}"
+    assert len(paths) == 2
 
-    # Replay mode - test both possible choices
     expected_results = set()
     for first_val in [1.0, 0.95]:
-        result = jnp.array([first_val, 2.0, 3.0])
-        expected_results.add(tuple(result.tolist()))
+        expected_results.add(tuple(jnp.array([first_val, 2.0, 3.0]).tolist()))
 
     actual_results = set()
-    for hash_choice in hashes:
-        with jnph.hash_mode("replay", replay_hash=hash_choice):
-            result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-            actual_results.add(tuple(result.value.tolist()))
+    for p in paths:
+        result = jnph.replay(f, p)(x1, x2b)
+        actual_results.add(tuple(result.tolist()))
 
-    assert actual_results == expected_results, f"Expected results {expected_results}, got {actual_results}"
+    assert actual_results == expected_results, f"Expected {expected_results}, got {actual_results}"
 
-    # Test case 3: Multiple values within tolerance
-    x1 = jnp.array([1.0, 2.0, 2.5])
-    x2 = jnp.array([0.95, 1.95, 2.45])  # All values within 0.1
+    x2c = jnp.array([0.95, 1.95, 2.45])
 
-    # Record mode
-    with jnph.hash_mode("record", 0.1) as hashes:
-        result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-        for i in range(3):
-            assert result.value[i] in [x1[i], x2[i]], f"Expected value at index {i} to be {x1[i]} or {x2[i]}, got {result.value[i]}"
+    val, paths = jnph.record(f, tol=0.1)(x1, x2c)
+    for i in range(3):
+        assert val[i] in [x1[i], x2c[i]]
+    assert len(paths) == 8
 
-        assert len(hashes) == 8, f"Test case 3 - Expected 8 hashes (2^3 combinations), got {len(hashes)}"  # All combinations of choices
-
-    # Replay mode
     expected_results = set()
-    for vals in product([x1[0], x2[0]], [x1[1], x2[1]], [x1[2], x2[2]]):
-        result = jnp.array(vals)
-        expected_results.add(tuple(result.tolist()))
+    for vals in product([x1[0], x2c[0]], [x1[1], x2c[1]], [x1[2], x2c[2]]):
+        expected_results.add(tuple(jnp.array(vals).tolist()))
 
     actual_results = set()
-    for hash_choice in hashes:
-        with jnph.hash_mode("replay", replay_hash=hash_choice):
-            result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-            actual_results.add(tuple(result.value.tolist()))
+    for p in paths:
+        result = jnph.replay(f, p)(x1, x2c)
+        actual_results.add(tuple(result.tolist()))
 
-    assert actual_results == expected_results, f"Expected results {expected_results}, got {actual_results}"
+    assert actual_results == expected_results, f"Expected {expected_results}, got {actual_results}"
+
 
 def test_minimum():
-    # Test case 1: No values within tolerance
     x1 = jnp.array([1.0, 2.0, 2.5])
     x2 = jnp.array([0.5, 1.5, 3.0])
 
-    # Record mode
-    with jnph.hash_mode("record", 0.1) as hashes:
-        result = jnph.minimum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-        assert jnp.allclose(result.value, jnp.array([0.5, 1.5, 2.5])), f"Expected [0.5, 1.5, 2.5], got {result.value}"
-        assert len(hashes) == 1  # One hash for original execution path
+    def f(x, y):
+        return jnph_np.minimum(x, y)
 
-    # Replay mode
-    with jnph.hash_mode("replay", replay_hash=hashes):
-        result = jnph.minimum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-        assert jnp.allclose(result.value, jnp.array([0.5, 1.5, 2.5])), f"Expected [0.5, 1.5, 2.5], got {result.value}"
+    val, paths = jnph.record(f, tol=0.1)(x1, x2)
+    assert jnp.allclose(val, jnp.array([0.5, 1.5, 2.5]))
+    assert len(paths) == 1
 
-    # Test case 2: One value within tolerance
-    x1 = jnp.array([1.0, 2.0, 2.5])
-    x2 = jnp.array([1.05, 1.5, 3.0])  # 1.05 is within 0.1 of 1.0
+    replayed = jnph.replay(f, paths[0])(x1, x2)
+    assert jnp.allclose(replayed, jnp.array([0.5, 1.5, 2.5]))
 
-    # Record mode
-    with jnph.hash_mode("record", 0.1) as hashes:
-        result = jnph.minimum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-        assert jnp.allclose(result.value[1:], jnp.array([1.5, 2.5])), f"Expected [1.5, 2.5] for indices 1:3, got {result.value[1:]}"
-        assert result.value[0] in [1.0, 1.05], f"Expected first value to be 1.0 or 1.05, got {result.value[0]}"
-        assert len(hashes) == 2, f"Expected 2 hashes (2^1 combinations), got {len(hashes)}"  # One index within tolerance
+    x2b = jnp.array([1.05, 1.5, 3.0])
 
-    # Replay mode
+    val, paths = jnph.record(f, tol=0.1)(x1, x2b)
+    assert jnp.allclose(val[1:], jnp.array([1.5, 2.5]))
+    assert val[0] in [1.0, 1.05]
+    assert len(paths) == 2
+
     expected_results = set()
     for first_val in [1.0, 1.05]:
-        result = jnp.array([first_val, 1.5, 2.5])
-        expected_results.add(tuple(result.tolist()))
+        expected_results.add(tuple(jnp.array([first_val, 1.5, 2.5]).tolist()))
 
     actual_results = set()
-    for hash_choice in hashes:
-        with jnph.hash_mode("replay", replay_hash=hash_choice):
-            result = jnph.minimum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-            actual_results.add(tuple(result.value.tolist()))
+    for p in paths:
+        result = jnph.replay(f, p)(x1, x2b)
+        actual_results.add(tuple(result.tolist()))
 
-    assert actual_results == expected_results, f"Expected results {expected_results}, got {actual_results}"
+    assert actual_results == expected_results
 
-    # Test case 3: Multiple values within tolerance
-    x1 = jnp.array([1.0, 2.0, 2.5])
-    x2 = jnp.array([1.05, 2.05, 2.55])  # All values within 0.1
+    x2c = jnp.array([1.05, 2.05, 2.55])
 
-    # Record mode
-    with jnph.hash_mode("record", 0.1) as hashes:
-        result = jnph.minimum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-        for i in range(3):
-            assert result.value[i] in [x1[i], x2[i]], f"Expected value at index {i} to be {x1[i]} or {x2[i]}, got {result.value[i]}"
-        assert len(hashes) == 8, f"Expected 8 hashes (2^3 combinations), got {len(hashes)}"  # All combinations of choices
+    val, paths = jnph.record(f, tol=0.1)(x1, x2c)
+    for i in range(3):
+        assert val[i] in [x1[i], x2c[i]]
+    assert len(paths) == 8
 
-    # Replay mode
     expected_results = set()
-    for vals in product([x1[0], x2[0]], [x1[1], x2[1]], [x1[2], x2[2]]):
-        result = jnp.array(vals)
-        expected_results.add(tuple(result.tolist()))
+    for vals in product([x1[0], x2c[0]], [x1[1], x2c[1]], [x1[2], x2c[2]]):
+        expected_results.add(tuple(jnp.array(vals).tolist()))
 
     actual_results = set()
-    for hash_choice in hashes:
-        with jnph.hash_mode("replay", replay_hash=hash_choice):
-            result = jnph.minimum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-            actual_results.add(tuple(result.value.tolist()))
+    for p in paths:
+        result = jnph.replay(f, p)(x1, x2c)
+        actual_results.add(tuple(result.tolist()))
 
-    assert actual_results == expected_results, f"Expected results {expected_results}, got {actual_results}"
+    assert actual_results == expected_results
+
 
 def test_abs():
-    # Test case 1: No values within tolerance of 0
+    def f(x):
+        return jnph_np.abs(x)
+
     x = jnp.array([-1.0, -2.0, 2.5])
+    val, paths = jnph.record(f, tol=0.1)(x)
+    assert jnp.allclose(val, jnp.array([1.0, 2.0, 2.5]))
+    assert len(paths) == 1
 
-    # Record mode
-    with jnph.hash_mode("record", 0.1) as hashes:
-        result = jnph.abs(jnph.HashTensor(x))
-        assert jnp.allclose(result.value, jnp.array([1.0, 2.0, 2.5])), f"Expected [1.0, 2.0, 2.5], got {result.value}"
-        assert len(hashes) == 1  # One hash for original execution path
+    replayed = jnph.replay(f, paths[0])(x)
+    assert jnp.allclose(replayed, jnp.array([1.0, 2.0, 2.5]))
 
-    # Replay mode
-    with jnph.hash_mode("replay", replay_hash=hashes):
-        result = jnph.abs(jnph.HashTensor(x))
-        assert jnp.allclose(result.value, jnp.array([1.0, 2.0, 2.5])), f"Expected [1.0, 2.0, 2.5], got {result.value}"
+    x2 = jnp.array([0.05, -2.0, 2.5])
+    val, paths = jnph.record(f, tol=0.1)(x2)
+    assert val[0] == 0.05
+    assert jnp.allclose(val[1:], jnp.array([2.0, 2.5]))
+    assert len(paths) == 2
 
-    # Test case 2: One value within tolerance of 0
-    x = jnp.array([0.05, -2.0, 2.5])  # 0.05 is within 0.1 of 0
-
-    # Record mode
-    with jnph.hash_mode("record", 0.1) as hashes:
-        result = jnph.abs(jnph.HashTensor(x))
-        assert result.value[0] == 0.05, f"Expected first value to be 0.05, got {result.value[0]}"
-        assert jnp.allclose(result.value[1:], jnp.array([2.0, 2.5])), f"Expected [2.0, 2.5] for indices 1:3, got {result.value[1:]}"
-        assert len(hashes) == 2, f"Expected 2 hashes (2^1 combinations), got {len(hashes)}"  # One index within tolerance
-
-    # Replay mode
     expected_results = set()
     for first_val in [0.05, -0.05]:
-        result = jnp.array([first_val, 2.0, 2.5])
-        expected_results.add(tuple(result.tolist()))
+        expected_results.add(tuple(jnp.array([first_val, 2.0, 2.5]).tolist()))
 
     actual_results = set()
-    for hash_choice in hashes:
-        with jnph.hash_mode("replay", replay_hash=hash_choice):
-            result = jnph.abs(jnph.HashTensor(x))
-            actual_results.add(tuple(result.value.tolist()))
+    for p in paths:
+        result = jnph.replay(f, p)(x2)
+        actual_results.add(tuple(result.tolist()))
 
-    assert actual_results == expected_results, f"Expected results {expected_results}, got {actual_results}"
+    assert actual_results == expected_results
 
-    # Test case 3: Multiple values within tolerance of 0
-    x = jnp.array([0.05, -0.05, 0.03])  # All values within 0.1 of 0
+    x3 = jnp.array([0.05, -0.05, 0.03])
+    val, paths = jnph.record(f, tol=0.1)(x3)
+    assert len(paths) == 8
 
-    # Record mode
-    with jnph.hash_mode("record", 0.1) as hashes:
-        result = jnph.abs(jnph.HashTensor(x))
-        for i in range(3):
-            assert result.value[i] in [abs(x[i]), -abs(x[i])], f"Expected value at index {i} to be +-{abs(x[i])}, got {result.value[i]}"
-        assert len(hashes) == 8, f"Expected 8 hashes (2^3 combinations), got {len(hashes)}"  # All combinations of choices
-
-    # Replay mode
     expected_results = set()
     for vals in product([0.05, -0.05], [0.05, -0.05], [0.03, -0.03]):
-        result = jnp.array(vals)
-        expected_results.add(tuple(result.tolist()))
+        expected_results.add(tuple(jnp.array(vals).tolist()))
 
     actual_results = set()
-    for hash_choice in hashes:
-        with jnph.hash_mode("replay", replay_hash=hash_choice):
-            result = jnph.abs(jnph.HashTensor(x))
-            actual_results.add(tuple(result.value.tolist()))
+    for p in paths:
+        result = jnph.replay(f, p)(x3)
+        actual_results.add(tuple(result.tolist()))
 
-    assert actual_results == expected_results, f"Expected results {expected_results}, got {actual_results}"
+    assert actual_results == expected_results
 
-def test_hash_set_operations():
-    """Test union, intersection, and difference operations."""
-    import jax.numpy as jnp
-    from jaxnp_hash import HashTensor, abs, hash_mode, max
 
-    # Create two different HashSets with different tolerances
+def test_path_set_operations():
     arr1 = jnp.array([1.01, 2.02, 3.03])
     arr2 = jnp.array([0.02, -0.01, 0.03])
 
-    # Record with tolerance 0.01 (tight)
-    with hash_mode("record", tol=0.01) as tight_hashes:
-        result1 = max(HashTensor(arr1))
-        result2 = abs(HashTensor(arr2))
+    def f(x, y):
+        r1 = jnph_np.max(x)
+        r2 = jnph_np.abs(y)
+        return jnph_np.sum(r2)
 
-    # Record with tolerance 0.1 (loose)
-    with hash_mode("record", tol=0.1) as loose_hashes:
-        result3 = max(HashTensor(arr1))
-        result4 = abs(HashTensor(arr2))
+    _, tight_paths = jnph.record(f, tol=0.01)(arr1, arr2)
+    _, loose_paths = jnph.record(f, tol=0.1)(arr1, arr2)
 
-    print(f"Tight tolerance: {len(tight_hashes)} hashes")
-    print(f"Loose tolerance: {len(loose_hashes)} hashes")
+    print(f"Tight tolerance: {len(tight_paths)} paths")
+    print(f"Loose tolerance: {len(loose_paths)} paths")
 
-    # Test union
-    union_set = tight_hashes.union(loose_hashes)
-    print(f"Union: {len(union_set)} hashes")
-    assert len(union_set) >= len(tight_hashes) and len(union_set) >= len(loose_hashes)
+    union_set = tight_paths.union(loose_paths)
+    print(f"Union: {len(union_set)} paths")
+    assert len(union_set) >= len(tight_paths) and len(union_set) >= len(loose_paths)
 
-    # Test intersection
-    intersection_set = tight_hashes.intersection(loose_hashes)
-    print(f"Intersection: {len(intersection_set)} hashes")
-    assert len(intersection_set) <= len(tight_hashes) and len(intersection_set) <= len(loose_hashes)
+    intersection_set = tight_paths.intersection(loose_paths)
+    print(f"Intersection: {len(intersection_set)} paths")
+    assert len(intersection_set) <= len(tight_paths) and len(intersection_set) <= len(loose_paths)
 
-    # Test difference
-    diff_set = loose_hashes.difference(tight_hashes)
-    print(f"Difference (loose - tight): {len(diff_set)} hashes")
+    diff_set = loose_paths.difference(tight_paths)
+    print(f"Difference (loose - tight): {len(diff_set)} paths")
 
-    # Verify set properties
-    # Union should contain all elements from both sets
-    for hash_item in tight_hashes:
-        assert hash_item in union_set or any(tight_hashes._hashes_equal(hash_item, u) for u in union_set)
+    for path in tight_paths:
+        assert path in union_set or any(jnph.PathSet._paths_equal(path, u) for u in union_set)
 
-    for hash_item in loose_hashes:
-        assert hash_item in union_set or any(loose_hashes._hashes_equal(hash_item, u) for u in union_set)
+    for path in loose_paths:
+        assert path in union_set or any(jnph.PathSet._paths_equal(path, u) for u in union_set)
 
-    # Intersection should only contain common elements
-    for hash_item in intersection_set:
-        # Check that this hash exists in both original sets
-        in_tight = hash_item in tight_hashes or any(tight_hashes._hashes_equal(hash_item, t) for t in tight_hashes)
-        in_loose = hash_item in loose_hashes or any(loose_hashes._hashes_equal(hash_item, l) for l in loose_hashes)
+    for path in intersection_set:
+        in_tight = path in tight_paths or any(jnph.PathSet._paths_equal(path, t) for t in tight_paths)
+        in_loose = path in loose_paths or any(jnph.PathSet._paths_equal(path, l) for l in loose_paths)
         assert in_tight and in_loose, "Intersection element should be in both sets"
 
     print("All set operations tests passed!")
 
-def test_hash_set_with_no_tolerance():
-    """Test HashSet behavior when no values are within tolerance."""
-    print("Testing HashSet with no tolerance effects...")
 
-    # Use values that are far apart
+def test_path_set_with_no_tolerance():
+    print("Testing PathSet with no tolerance effects...")
+
     x1 = jnp.array([1.0, 5.0, 10.0])
     x2 = jnp.array([2.0, 6.0, 11.0])
 
-    with jnph.hash_mode("record", 0.1) as hashes:  # Tolerance too small to matter
-        result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
+    def f(x, y):
+        return jnph_np.maximum(x, y)
 
-    # Should only have 1 hash since no values are within tolerance
-    assert len(hashes) == 1, f"Expected 1 hash when no values within tolerance, got {len(hashes)}"
+    val, paths = jnph.record(f, tol=0.1)(x1, x2)
+    assert len(paths) == 1
 
-    # Test the single hash
-    hash_list = list(hashes)
-    assert len(hash_list) == 1, "Should be able to iterate and get exactly 1 hash"
+    path_list = list(paths)
+    assert len(path_list) == 1
 
-    # Test replay with the single hash
-    with jnph.hash_mode("replay", replay_hash=hash_list[0]):
-        replay_result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-        expected = jnp.array([2.0, 6.0, 11.0])  # Standard maximum
-        assert jnp.allclose(replay_result.value, expected), \
-            f"Expected {expected}, got {replay_result.value}"
+    replay_result = jnph.replay(f, path_list[0])(x1, x2)
+    expected = jnp.array([2.0, 6.0, 11.0])
+    assert jnp.allclose(replay_result, expected), f"Expected {expected}, got {replay_result}"
 
     print("✓ No tolerance test passed!")
 
-def test_hash_set_membership():
-    """Test membership operations on HashSet."""
-    print("Testing HashSet membership...")
+
+def test_path_set_membership():
+    print("Testing PathSet membership...")
 
     x1 = jnp.array([1.0, 2.0])
-    x2 = jnp.array([1.05, 1.95])  # Both within 0.1 tolerance
+    x2 = jnp.array([1.05, 1.95])
 
-    with jnph.hash_mode("record", 0.1) as hashes:
-        result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
+    def f(x, y):
+        return jnph_np.maximum(x, y)
 
-    # Should have 4 hashes (2^2)
-    assert len(hashes) == 4, f"Expected 4 hashes, got {len(hashes)}"
+    _, paths = jnph.record(f, tol=0.1)(x1, x2)
+    assert len(paths) == 4
 
-    # Test iteration consistency - each iteration should produce the same number of hashes
-    iteration1 = list(hashes)
-    iteration2 = list(hashes)
-    iteration3 = list(hashes)
+    iteration1 = list(paths)
+    iteration2 = list(paths)
+    iteration3 = list(paths)
 
-    assert len(iteration1) == len(iteration2) == len(iteration3) == 4, \
-        "Each iteration should produce the same number of hashes"
+    assert len(iteration1) == len(iteration2) == len(iteration3) == 4
 
-    # Test that all hashes produce valid results when replayed
     valid_results = set()
-    for i, hash_choice in enumerate(iteration1):
-        # Get fresh copy for replay
-        with jnph.hash_mode("record", 0.1) as fresh_hashes:
-            result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-        fresh_list = list(fresh_hashes)
+    for i, p in enumerate(iteration1):
+        _, fresh_paths = jnph.record(f, tol=0.1)(x1, x2)
+        fresh_list = list(fresh_paths)
 
-        # Use the i-th hash from the fresh list (should be equivalent)
-        with jnph.hash_mode("replay", replay_hash=fresh_list[i]):
-            replay_result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
-            result_tuple = tuple(replay_result.value.tolist())
-            valid_results.add(result_tuple)
+        replay_result = jnph.replay(f, fresh_list[i])(x1, x2)
+        result_tuple = tuple(replay_result.tolist())
+        valid_results.add(result_tuple)
 
-            # Verify each value is from either x1 or x2
-            for j, val in enumerate(replay_result.value):
-                assert val in [x1[j], x2[j]], \
-                    f"Result value {val} at index {j} should be from x1 or x2"
+        for j, val in enumerate(replay_result):
+            assert val in [x1[j], x2[j]], \
+                f"Result value {val} at index {j} should be from x1 or x2"
 
-    # Should have exactly 4 unique results (2^2 combinations)
     assert len(valid_results) == 4, \
-        f"Expected 4 unique results from 4 hashes, got {len(valid_results)}"
+        f"Expected 4 unique results from 4 paths, got {len(valid_results)}"
 
     print("✓ Membership test passed!")
 
-def test_hash_set_random_access():
-    """Test random access to HashSet elements using [] operator."""
-    print("Testing HashSet random access...")
+
+def test_path_set_random_access():
+    print("Testing PathSet random access...")
 
     x1 = jnp.array([1.0, 2.0])
-    x2 = jnp.array([1.05, 1.95])  # Both within 0.1 tolerance
+    x2 = jnp.array([1.05, 1.95])
 
-    with jnph.hash_mode("record", 0.1) as hashes:
-        result = jnph.maximum(jnph.HashTensor(x1), jnph.HashTensor(x2))
+    def f(x, y):
+        return jnph_np.maximum(x, y)
 
-    # Should have 4 hashes (2^2)
-    assert len(hashes) == 4, f"Expected 4 hashes, got {len(hashes)}"
+    _, paths = jnph.record(f, tol=0.1)(x1, x2)
+    assert len(paths) == 4
 
-    # Test that we can access all elements by index
-    accessed_hashes = []
-    for i in range(len(hashes)):
-        hash_at_i = hashes[i]
-        accessed_hashes.append(hash_at_i)
-        print(f"Hash at index {i}: {hash_at_i}")
+    accessed = []
+    for i in range(len(paths)):
+        p = paths[i]
+        accessed.append(p)
+        print(f"Path at index {i}: {p}")
 
-    # Test that random access gives the same results as iteration
-    iteration_hashes = list(hashes)
-    assert len(accessed_hashes) == len(iteration_hashes), \
-        "Random access should give same number of hashes as iteration"
+    iteration = list(paths)
+    assert len(accessed) == len(iteration)
 
-    # Compare each hash (they should be in the same order)
-    for i, (access_hash, iter_hash) in enumerate(zip(accessed_hashes, iteration_hashes)):
-        assert hashes._hashes_equal(access_hash, iter_hash), \
-            f"Hash at index {i} should be the same from random access and iteration"
+    for i, (a, it) in enumerate(zip(accessed, iteration)):
+        assert jnph.PathSet._paths_equal(a, it), \
+            f"Path at index {i} should be the same from random access and iteration"
 
-    # Test negative indices
-    assert hashes._hashes_equal(hashes[-1], hashes[3]), "Negative index -1 should equal index 3"
-    assert hashes._hashes_equal(hashes[-2], hashes[2]), "Negative index -2 should equal index 2"
+    assert paths[-1] == paths[3]
+    assert paths[-2] == paths[2]
 
-    # Test out-of-bounds access
     try:
-        _ = hashes[4]  # Should raise IndexError
+        _ = paths[4]
         assert False, "Should have raised IndexError for index 4"
     except IndexError:
-        pass  # Expected
+        pass
 
     try:
-        _ = hashes[-5]  # Should raise IndexError
+        _ = paths[-5]
         assert False, "Should have raised IndexError for index -5"
     except IndexError:
-        pass  # Expected
+        pass
 
-    # Test type error for non-integer index
     try:
-        _ = hashes["invalid"]  # Should raise TypeError
+        _ = paths["invalid"]
         assert False, "Should have raised TypeError for string index"
     except TypeError:
-        pass  # Expected
+        pass
 
-    # Test consistency - accessing the same index multiple times should give the same result
-    first_access = hashes[1]
-    second_access = hashes[1]
-    assert hashes._hashes_equal(first_access, second_access), \
-        "Multiple accesses to same index should give same result"
+    first_access = paths[1]
+    second_access = paths[1]
+    assert first_access == second_access
 
     print("✓ Random access test passed!")
+
+
+def test_record_and_replay():
+    x1 = jnp.array([1.0, 2.0, 2.5])
+    x2 = jnp.array([0.95, 1.5, 3.0])
+
+    def f(x, y):
+        return jnph_np.maximum(x, y)
+
+    val, paths = jnph.record(f, tol=0.1)(x1, x2)
+    assert isinstance(paths, jnph.PathSet)
+    assert len(paths) == 2
+
+    results = []
+    for p in paths:
+        assert isinstance(p, jnph.BranchPath)
+        replayed_val = jnph.replay(f, p)(x1, x2)
+        results.append(replayed_val)
+
+    assert len(results) == 2
+    first_vals = sorted([float(r[0]) for r in results])
+    assert jnp.allclose(first_vals[0], 0.95, atol=1e-6)
+    assert jnp.allclose(first_vals[1], 1.0, atol=1e-6)
+    for r in results:
+        assert jnp.allclose(r[1], 2.0)
+        assert jnp.allclose(r[2], 3.0)
+
+
+def test_record_no_tolerance():
+    x = jnp.array([1.0, 5.0, 10.0])
+
+    def f(x):
+        return jnph_np.max(x)
+
+    val, paths = jnph.record(f, tol=0.0)(x)
+    assert len(paths) == 1
+    assert float(val) == 10.0
+
+
+def test_grad_simple():
+    x = jnp.array([1.0, 3.0, 2.0])
+
+    def f(x):
+        return jnph_np.max(x)
+
+    g, paths = jnph.grad(f, tol=0.0)(x)
+    assert g.shape == x.shape
+    assert jnp.allclose(g, jnp.array([0.0, 1.0, 0.0])), f"Expected [0, 1, 0], got {g}"
+    assert len(paths) == 1
+
+
+def test_grad_with_tolerance():
+    x = jnp.array([1.0, 1.05, 0.5])
+
+    def f(x):
+        return jnph_np.max(x)
+
+    g, paths = jnph.grad(f, tol=0.1)(x)
+    assert len(paths) == 2
+    assert g.shape == x.shape
+
+
+def test_value_and_grad_simple():
+    x = jnp.array([1.0, 3.0, 2.0])
+
+    def f(x):
+        return jnph_np.sum(x)
+
+    (val, g), paths = jnph.value_and_grad(f, tol=0.0)(x)
+    assert jnp.allclose(val, 6.0)
+    assert jnp.allclose(g, jnp.array([1.0, 1.0, 1.0])), f"Expected [1, 1, 1], got {g}"
+    assert len(paths) == 1
+
+
+def test_value_and_grad_maximum():
+    x = jnp.array([1.0, 2.0, 3.0])
+    y = jnp.array([1.5, 1.5, 1.5])
+
+    def f(x, y):
+        return jnph_np.sum(jnph_np.maximum(x, y))
+
+    (val, g), paths = jnph.value_and_grad(f, argnums=0, tol=0.0)(x, y)
+    assert float(val) == 1.5 + 2.0 + 3.0
+    assert jnp.allclose(g, jnp.array([0.0, 1.0, 1.0])), f"Expected [0, 1, 1], got {g}"
+
+
+def test_replay_grad():
+    x = jnp.array([1.0, 1.05, 0.5])
+
+    def f(x):
+        return jnph_np.max(x)
+
+    _, paths = jnph.record(f, tol=0.1)(x)
+    assert len(paths) >= 2
+
+    grads = []
+    for p in paths:
+        g = jnph.replay_grad(f, p)(x)
+        grads.append(g)
+
+    grad_tuples = set(tuple(float(v) for v in g) for g in grads)
+    assert (0.0, 1.0, 0.0) in grad_tuples or (1.0, 0.0, 0.0) in grad_tuples
+
+
+def test_replay_value_and_grad():
+    x = jnp.array([1.0, 2.0, 2.5])
+    y = jnp.array([0.95, 1.5, 3.0])
+
+    def f(x, y):
+        return jnph_np.sum(jnph_np.maximum(x, y))
+
+    _, paths = jnph.record(f, tol=0.1)(x, y)
+
+    for p in paths:
+        replayed_val = jnph.replay(f, p)(x, y)
+        v, g = jnph.replay_value_and_grad(f, p, argnums=0)(x, y)
+        assert jnp.allclose(v, replayed_val), f"value_and_grad value {v} != replay value {replayed_val}"
+        assert g.shape == x.shape
+
+
+def test_grad_argnums():
+    x = jnp.array([1.0, 2.0, 3.0])
+    y = jnp.array([1.5, 1.5, 1.5])
+
+    def f(x, y):
+        return jnph_np.sum(jnph_np.maximum(x, y))
+
+    g_x, _ = jnph.grad(f, argnums=0, tol=0.0)(x, y)
+    assert jnp.allclose(g_x, jnp.array([0.0, 1.0, 1.0]))
+
+    g_y, _ = jnph.grad(f, argnums=1, tol=0.0)(x, y)
+    assert jnp.allclose(g_y, jnp.array([1.0, 0.0, 0.0]))
+
+    (g_x2, g_y2), _ = jnph.grad(f, argnums=(0, 1), tol=0.0)(x, y)
+    assert jnp.allclose(g_x2, g_x)
+    assert jnp.allclose(g_y2, g_y)
+
+
+def test_has_aux():
+    x = jnp.array([1.0, 2.0, 3.0])
+    y = jnp.array([1.5, 1.5, 1.5])
+
+    def f_aux(x, y):
+        result = jnph_np.maximum(x, y)
+        s = jnph_np.sum(result)
+        aux = {"max_val": jnph_np.max(result)}
+        return s, aux
+
+    (g, aux), paths = jnph.grad(f_aux, argnums=0, tol=0.0, has_aux=True)(x, y)
+    assert "max_val" in aux
+    assert g.shape == x.shape
+    assert jnp.allclose(g, jnp.array([0.0, 1.0, 1.0]))
+
+    (val, g2, aux2), paths2 = jnph.value_and_grad(f_aux, argnums=0, tol=0.0, has_aux=True)(x, y)
+    assert float(val) == 1.5 + 2.0 + 3.0
+    assert jnp.allclose(g2, g)
+    assert "max_val" in aux2
+
+
+def test_replay_grad_has_aux():
+    x = jnp.array([1.0, 2.0, 3.0])
+    y = jnp.array([1.05, 1.95, 2.95])
+
+    def f_aux(x, y):
+        result = jnph_np.maximum(x, y)
+        s = jnph_np.sum(result)
+        return s, {"count": len(x)}
+
+    _, paths = jnph.record(f_aux, tol=0.1)(x, y)
+
+    for p in paths:
+        g, aux = jnph.replay_grad(f_aux, p, argnums=0, has_aux=True)(x, y)
+        assert g.shape == x.shape
+        assert aux["count"] == 3
+
+        v, g2, aux2 = jnph.replay_value_and_grad(f_aux, p, argnums=0, has_aux=True)(x, y)
+        assert jnp.allclose(g, g2)
+        assert aux2["count"] == 3
+
+
+def test_path_types():
+    x1 = jnp.array([1.0, 2.0])
+    x2 = jnp.array([1.05, 1.95])
+
+    def f(x, y):
+        return jnph_np.maximum(x, y)
+
+    _, paths = jnph.record(f, tol=0.1)(x1, x2)
+
+    assert isinstance(paths, jnph.PathSet)
+    assert len(paths) == 4
+
+    for p in paths:
+        assert isinstance(p, jnph.BranchPath)
+        assert len(p) == 1
+
+    p0 = paths[0]
+    assert isinstance(p0, jnph.BranchPath)
+
+    assert paths[-1] == paths[3]
+    assert paths[0] != paths[1]
+
+
+def test_branch_path_equality():
+    x1 = jnp.array([1.0, 2.0])
+    x2 = jnp.array([1.05, 1.95])
+
+    def f(x, y):
+        return jnph_np.maximum(x, y)
+
+    _, paths1 = jnph.record(f, tol=0.1)(x1, x2)
+    _, paths2 = jnph.record(f, tol=0.1)(x1, x2)
+
+    for p1, p2 in zip(paths1, paths2):
+        assert p1 == p2
+
+    all_paths = list(paths1)
+    assert all_paths[0] != all_paths[1]
+
+
+def test_passthrough_outside_mode():
+    x = jnp.array([1.0, 2.0, 3.0])
+    y = jnp.array([1.5, 1.5, 1.5])
+
+    result = jnph_np.maximum(x, y)
+    assert jnp.allclose(result, jnp.array([1.5, 2.0, 3.0]))
+
+    result = jnph_np.sum(x)
+    assert float(result) == 6.0
+
+    result = jnph_np.max(x)
+    assert float(result) == 3.0
+
+    result = jnph_np.abs(jnp.array([-1.0, 2.0]))
+    assert jnp.allclose(result, jnp.array([1.0, 2.0]))
+
+    result = jnph_np.min(x)
+    assert float(result) == 1.0
+
+    result = jnph_np.minimum(x, y)
+    assert jnp.allclose(result, jnp.array([1.0, 1.5, 1.5]))
+
+
+def test_numpy_non_overridden_functions():
+    x = jnp.array([1.0, 2.0, 3.0])
+    assert jnp.allclose(jnph_np.sin(x), jnp.sin(x))
+    assert jnp.allclose(jnph_np.exp(x), jnp.exp(x))
+    assert jnph_np.array([1, 2, 3]).dtype == jnp.array([1, 2, 3]).dtype
 
 
 if __name__ == "__main__":
     test_maximum()
     test_minimum()
     test_abs()
-    test_hash_set_operations()
-    test_hash_set_with_no_tolerance()
-    test_hash_set_membership()
-    test_hash_set_random_access()
+    test_path_set_operations()
+    test_path_set_with_no_tolerance()
+    test_path_set_membership()
+    test_path_set_random_access()
+    test_record_and_replay()
+    test_record_no_tolerance()
+    test_grad_simple()
+    test_grad_with_tolerance()
+    test_value_and_grad_simple()
+    test_value_and_grad_maximum()
+    test_replay_grad()
+    test_replay_value_and_grad()
+    test_grad_argnums()
+    test_has_aux()
+    test_replay_grad_has_aux()
+    test_path_types()
+    test_branch_path_equality()
+    test_passthrough_outside_mode()
+    test_numpy_non_overridden_functions()
     print("All tests passed!")

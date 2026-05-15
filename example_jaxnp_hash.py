@@ -1,88 +1,85 @@
 #!/usr/bin/env python3
 """
-Example demonstrating the HashSet interface for jaxnp_hash.
+Example demonstrating the jaxnp_hash functional API.
 
-This example shows how to:
-1. Record operations with different tolerances
-2. Use the HashSet as a set-like data structure
-3. Compare branch paths taken during execution, not just final results
-4. Explore how different hash choices represent different execution paths
+User functions are written with standard-looking numpy calls via
+jaxnp_hash.numpy, which transparently intercepts max/min/maximum/
+minimum/abs/sum during record and replay.
 """
 
-import jax
 import jax.numpy as jnp
 import jaxnp_hash as jnph
+import jaxnp_hash.numpy as jnp_h
 
 
 def branching_function(x, y):
-    """An example function that has nearby branches."""
-    # Convert to HashTensors
-    hx = jnph.HashTensor(x)
-    hy = jnph.HashTensor(y)
+    result1 = jnp_h.maximum(x, y)
+    result2 = jnp_h.abs(result1)
+    result3 = jnp_h.max(result2)
+    return result3
 
-    result1 = jnph.maximum(hx, hy)  # Choice point 1: indices [0, 2] within tolerance
 
-    result2 = jnph.abs(result1)     # Choice point 2: element [1] near zero
+def simple_function(x):
+    return jnp_h.max(x)
 
-    result3 = jnph.max(result2)      # Choice point 3: scaled values close to each other
 
-    return result3.value
+def aux_function(x, y):
+    result = jnp_h.maximum(x, y)
+    s = jnp_h.sum(result)
+    return s, {"max_elem": jnp_h.max(result)}
 
-print("=== Simple HashSet Example ===\n")
 
-# Create test data
 x = jnp.array([1.0, 0.05, 0.94])
 y = jnp.array([1.05, -1.5, 1.01])
 
-print(f"Input x: {x}")
-print(f"Input y: {y}")
+print("=== Functional API Example ===\n")
+
+# 1. record / replay
+print("1. Record and replay:")
+val, paths = jnph.record(branching_function, tol=0.1)(x, y)
+print(f"   Recorded value: {val}")
+print(f"   Number of paths: {len(paths)}")
+
+for i, p in enumerate(paths):
+    replayed_val = jnph.replay(branching_function, p)(x, y)
+    print(f"   Path {i+1}: {replayed_val}")
+    print(f"     {paths.format_path(p)}")
 print()
 
-# Example 1: Record with tight tolerance
-print("1. Recording with tight tolerance (0.01):")
-with jnph.hash_mode("record", tol=0.01) as tight_hashes:
-    result = branching_function(x, y)
-
-print(f"   Result: {result}")
-print(f"   Number of execution paths: {len(tight_hashes)}")
-print(f"   HashSet: {tight_hashes}")
+# 2. grad
+print("2. grad (record + differentiate w.r.t. x):")
+g, paths = jnph.grad(simple_function, tol=0.1)(x)
+print(f"   Gradient (default path): {g}")
+print(f"   Number of paths: {len(paths)}")
 print()
 
-# Example 2: Record with loose tolerance
-print("2. Recording with loose tolerance (0.1):")
-with jnph.hash_mode("record", tol=0.1) as loose_hashes:
-    result = branching_function(x, y)
-
-print(f"   Result: {result}")
-print(f"   Number of execution paths: {len(loose_hashes)}")
-print(f"   HashSet: {loose_hashes}")
+# 3. value_and_grad
+print("3. value_and_grad:")
+(val, g), paths = jnph.value_and_grad(simple_function, tol=0.1)(x)
+print(f"   Value: {val}, Gradient: {g}")
+print(f"   Number of paths: {len(paths)}")
 print()
 
-# Example 3: Iterate through some paths
-print("3. Exploring different execution paths:")
-with jnph.hash_mode("record", tol=0.1) as hashes:
-    branching_function(x, y)
+# 4. replay_value_and_grad for each path
+print("4. replay_value_and_grad for each path:")
+for i, p in enumerate(paths):
+    v, g = jnph.replay_value_and_grad(simple_function, p)(x)
+    print(f"   Path {i+1}: value={v}, grad={g}")
+print()
 
-print(f"   Total paths available: {len(hashes)}")
-print("   Showing all paths:")
+# 5. has_aux example
+print("5. value_and_grad with has_aux:")
+(val, g, aux), paths = jnph.value_and_grad(aux_function, argnums=0, tol=0.1, has_aux=True)(x, y)
+print(f"   Value: {val}")
+print(f"   Gradient: {g}")
+print(f"   Aux: {aux}")
+print(f"   Number of paths: {len(paths)}")
+print()
 
-for i, hash_choice in enumerate(hashes):
-    with jnph.hash_mode("replay", replay_hash=hash_choice):
-        path_result = branching_function(x, y)
+# 6. replay_grad with has_aux
+print("6. replay_grad with has_aux for each path:")
+for i, p in enumerate(paths):
+    g, aux = jnph.replay_grad(aux_function, p, argnums=0, has_aux=True)(x, y)
+    print(f"   Path {i+1}: grad={g}, aux={aux}")
 
-    print(f"     Path {i+1}: Result = {path_result}")
-    print(f"       Branches taken:")
-
-    # Create a formatted trace showing the decision points
-    if hasattr(hashes, '_hash_set') and hashes._hash_set and hashes._hash_set.trace:
-        from jaxnp_hash.HashTensor import _TraceNode
-        manual_choice = []
-        for node in hashes._hash_set.trace:
-            manual_choice.append(_TraceNode(node.name, [node.currentChoice()]))
-
-        formatted_trace = hashes.format_hash_choice(manual_choice)
-        print(formatted_trace)
-    else:
-        print("       No trace information available")
-
-print("=== HashSet Demo Complete! ===")
+print("\n=== Functional API Demo Complete! ===")
