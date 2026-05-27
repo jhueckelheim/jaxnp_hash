@@ -523,6 +523,90 @@ def test_branch_path_equality():
     assert all_paths[0] != all_paths[1]
 
 
+def test_all_value_and_grad_simple():
+    x = jnp.array([1.0, 3.0, 2.0])
+
+    def f(x):
+        return jnph_np.max(x)
+
+    results, paths = jnph.all_value_and_grad(f, tol=0.0)(x)
+    assert len(results) == 1
+    assert len(paths) == 1
+    val, grad = results[0]
+    assert jnp.allclose(val, 3.0)
+    assert jnp.allclose(grad, jnp.array([0.0, 1.0, 0.0]))
+
+
+def test_all_value_and_grad_with_tolerance():
+    x = jnp.array([1.0, 1.05, 0.5])
+
+    def f(x):
+        return jnph_np.max(x)
+
+    results, paths = jnph.all_value_and_grad(f, tol=0.1)(x)
+    assert len(paths) == 2
+    assert len(results) == 2
+
+    values = set()
+    grad_tuples = set()
+    for val, grad in results:
+        values.add(float(val))
+        grad_tuples.add(tuple(float(v) for v in grad))
+
+    assert (0.0, 1.0, 0.0) in grad_tuples
+    assert (1.0, 0.0, 0.0) in grad_tuples
+
+
+def test_all_value_and_grad_matches_manual():
+    x = jnp.array([1.0, 2.0, 2.5])
+    y = jnp.array([0.95, 1.5, 3.0])
+
+    def f(x, y):
+        return jnph_np.sum(jnph_np.maximum(x, y))
+
+    results, paths = jnph.all_value_and_grad(f, argnums=0, tol=0.1)(x, y)
+
+    for i, path in enumerate(paths):
+        manual_v, manual_g = jnph.replay_value_and_grad(f, path, argnums=0)(x, y)
+        api_v, api_g = results[i]
+        assert jnp.allclose(api_v, manual_v)
+        assert jnp.allclose(api_g, manual_g)
+
+
+def test_all_value_and_grad_has_aux():
+    x = jnp.array([1.0, 2.0, 3.0])
+    y = jnp.array([1.05, 1.95, 2.95])
+
+    def f_aux(x, y):
+        result = jnph_np.maximum(x, y)
+        s = jnph_np.sum(result)
+        return s, {"count": len(x)}
+
+    results, paths = jnph.all_value_and_grad(f_aux, argnums=0, tol=0.1, has_aux=True)(x, y)
+    assert len(results) == len(paths)
+
+    for val, grad, aux in results:
+        assert aux["count"] == 3
+        assert grad.shape == x.shape
+
+
+def test_all_value_and_grad_argnums():
+    x = jnp.array([1.0, 2.0, 3.0])
+    y = jnp.array([1.5, 1.5, 1.5])
+
+    def f(x, y):
+        return jnph_np.sum(jnph_np.maximum(x, y))
+
+    results_x, _ = jnph.all_value_and_grad(f, argnums=0, tol=0.0)(x, y)
+    assert len(results_x) == 1
+    val, g_x = results_x[0]
+    assert jnp.allclose(g_x, jnp.array([0.0, 1.0, 1.0]))
+
+    results_y, _ = jnph.all_value_and_grad(f, argnums=1, tol=0.0)(x, y)
+    val, g_y = results_y[0]
+    assert jnp.allclose(g_y, jnp.array([1.0, 0.0, 0.0]))
+
+
 def test_passthrough_outside_mode():
     x = jnp.array([1.0, 2.0, 3.0])
     y = jnp.array([1.5, 1.5, 1.5])
@@ -574,6 +658,11 @@ if __name__ == "__main__":
     test_replay_grad_has_aux()
     test_path_types()
     test_branch_path_equality()
+    test_all_value_and_grad_simple()
+    test_all_value_and_grad_with_tolerance()
+    test_all_value_and_grad_matches_manual()
+    test_all_value_and_grad_has_aux()
+    test_all_value_and_grad_argnums()
     test_passthrough_outside_mode()
     test_numpy_non_overridden_functions()
     print("All tests passed!")

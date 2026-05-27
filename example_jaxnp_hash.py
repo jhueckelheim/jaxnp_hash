@@ -82,4 +82,19 @@ for i, p in enumerate(paths):
     g, aux = jnph.replay_grad(aux_function, p, argnums=0, has_aux=True)(x, y)
     print(f"   Path {i+1}: grad={g}, aux={aux}")
 
+# 7. all_value_and_grad
+print("\n7. all_value_and_grad (all paths in one call):")
+results, paths = jnph.all_value_and_grad(simple_function, tol=0.1)(x)
+print(f"   Number of paths: {len(paths)}")
+for i, (v, g) in enumerate(results):
+    print(f"   Path {i+1}: value={v}, grad={g}")
+print()
+
+# 8. all_value_and_grad with has_aux
+print("8. all_value_and_grad with has_aux:")
+results, paths = jnph.all_value_and_grad(aux_function, argnums=0, tol=0.1, has_aux=True)(x, y)
+print(f"   Number of paths: {len(paths)}")
+for i, (v, g, aux) in enumerate(results):
+    print(f"   Path {i+1}: value={v}, grad={g}, aux={aux}")
+
 print("\n=== Functional API Demo Complete! ===")

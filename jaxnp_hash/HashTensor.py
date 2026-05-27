@@ -583,3 +583,14 @@ def replay_value_and_grad(fun, path, argnums=0, has_aux=False):
             value, grads = vg_result
             return value, grads
     return replayed_val_grad
+
+
+def all_value_and_grad(fun, argnums=0, tol=0.0, has_aux=False):
+    def all_vg_fn(*args, **kwargs):
+        _, paths = record(fun, tol=tol)(*args, **kwargs)
+        results = []
+        for path in paths:
+            vg_fn = replay_value_and_grad(fun, path, argnums=argnums, has_aux=has_aux)
+            results.append(vg_fn(*args, **kwargs))
+        return results, paths
+    return all_vg_fn

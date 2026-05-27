@@ -8,4 +8,5 @@ from .HashTensor import (
     value_and_grad,
     replay_grad,
     replay_value_and_grad,
+    all_value_and_grad,
 )
