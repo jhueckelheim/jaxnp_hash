@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 if not any(getattr(handler, "_hashtensor_debug_handler", False) for handler in logger.handlers):
     handler = logging.StreamHandler()
     handler.setLevel(logging.DEBUG)
@@ -21,25 +21,11 @@ _replay_pos: ContextVar[int] = ContextVar('_replay_pos', default=0)
 _tolerance: ContextVar[float] = ContextVar('_tolerance', default=0)
 
 
-def _normalize_choice(choice):
-    if isinstance(choice, tuple) and len(choice) == 2 and isinstance(choice[1], (int, jnp.integer)):
-        indices, val = choice
-        if hasattr(indices, 'tolist'):
-            indices = tuple(int(x) for x in indices.tolist())
-        return (indices, int(val))
-    if hasattr(choice, 'tolist'):
-        raw = choice.tolist()
-        if isinstance(raw, list):
-            return tuple(raw)
-        return raw
-    return choice
-
-
 class _TraceNode:
     def __init__(self, name, choices):
         logger.debug(f"_TraceNode.__init__: name={name}, num_choices={len(choices)}")
         self.name = name
-        self.choices = [_normalize_choice(c) for c in choices]
+        self.choices = list(choices)
         self.num = len(self.choices)
         self.pos = 0
 
@@ -419,6 +405,7 @@ def max(inval):
         loc = jnp.argmax(inval.value)
         val = inval.value[loc]
         nearby_locs, = jnp.where(inval.value >= val - _tolerance.get())
+        nearby_locs = tuple(int(x) for x in nearby_locs.tolist())
         logger.debug(f"max: recording - loc={loc}, val={val}, nearby_locs={nearby_locs}")
         _trace_append("max", nearby_locs)
     else:
@@ -434,6 +421,7 @@ def min(inval):
         loc = jnp.argmin(inval.value)
         val = inval.value[loc]
         nearby_locs, = jnp.where(inval.value <= val + _tolerance.get())
+        nearby_locs = tuple(int(x) for x in nearby_locs.tolist())
         logger.debug(f"min: recording - loc={loc}, val={val}, nearby_locs={nearby_locs}")
         _trace_append("min", nearby_locs)
     else:
@@ -447,6 +435,7 @@ def _elementwise_minmax(one, two, name, jnp_op, prefer_first):
     logger.debug(f"{name}: one={one.value}, two={two.value}")
     if _is_recording.get():
         nearby_indices = jnp.where(jnp.abs(one.value - two.value) <= _tolerance.get())[0]
+        nearby_indices = tuple(int(x) for x in nearby_indices.tolist())
         logger.debug(f"{name}: recording - nearby_indices={nearby_indices}")
         n_choices = 2 ** len(nearby_indices)
         choices = [(nearby_indices, i) for i in range(n_choices)]
@@ -488,6 +477,7 @@ def abs(inval):
     logger.debug(f"abs: input={inval.value}")
     if _is_recording.get():
         nearby_indices = jnp.where(jnp.abs(inval.value) <= _tolerance.get())[0]
+        nearby_indices = tuple(int(x) for x in nearby_indices.tolist())
         logger.debug(f"abs: recording - nearby_indices={nearby_indices}")
         n_choices = 2 ** len(nearby_indices)
         choices = [(nearby_indices, i) for i in range(n_choices)]
