@@ -6,7 +6,13 @@ import jax
 import jax.numpy as jnp
 
 logger = logging.getLogger(__name__)
-logger.addHandler(logging.NullHandler())
+logger.setLevel(logging.DEBUG)
+if not any(getattr(handler, "_hashtensor_debug_handler", False) for handler in logger.handlers):
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    handler._hashtensor_debug_handler = True
+    logger.addHandler(handler)
 
 _is_recording: ContextVar[bool] = ContextVar('_is_recording', default=False)
 _recorded_trace: ContextVar[list] = ContextVar('_recorded_trace', default=[])
@@ -587,10 +593,41 @@ def replay_value_and_grad(fun, path, argnums=0, has_aux=False):
 
 def all_value_and_grad(fun, argnums=0, tol=0.0, has_aux=False):
     def all_vg_fn(*args, **kwargs):
-        _, paths = record(fun, tol=tol)(*args, **kwargs)
+        defaultresult, paths = record(fun, tol=tol)(*args, **kwargs)
         results = []
         for path in paths:
             vg_fn = replay_value_and_grad(fun, path, argnums=argnums, has_aux=has_aux)
             results.append(vg_fn(*args, **kwargs))
-        return results, paths
+        return defaultresult, results, paths
     return all_vg_fn
+
+
+def h_fun(fun, argnums=0, tol=0.0, has_aux=False):
+    import numpy as np
+
+    def wrapped(z, H0=None):
+        z_jax = jnp.asarray(z)
+
+        if H0 is None:
+            defaultresult, results, paths = all_value_and_grad(fun, argnums=argnums, tol=tol, has_aux=has_aux)(z_jax)
+
+            grads = np.zeros((z_jax.shape[0], len(paths)), dtype=float)
+            h_vals = np.zeros(len(paths), dtype=float)
+            for k, (v, g) in enumerate(results):
+                h_vals[k] = float(v)
+                grads[:, k] = np.asarray(g)
+
+            return defaultresult, grads, paths
+        else:
+            J = len(H0)
+            h = np.zeros(J, dtype=float)
+            grads = np.zeros((z_jax.shape[0], J), dtype=float)
+
+            for k, path in enumerate(H0):
+                v, g = replay_value_and_grad(fun, path, argnums=argnums, has_aux=has_aux)(z_jax)
+                h[k] = float(v)
+                grads[:, k] = np.asarray(g)
+
+            return h, grads
+
+    return wrapped

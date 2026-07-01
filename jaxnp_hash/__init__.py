@@ -9,4 +9,5 @@ from .HashTensor import (
     replay_grad,
     replay_value_and_grad,
     all_value_and_grad,
+    h_fun,
 )
