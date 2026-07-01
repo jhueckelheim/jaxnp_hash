@@ -318,7 +318,7 @@ def test_record_and_replay():
 
     results = []
     for p in paths:
-        assert isinstance(p, jnph.BranchPath)
+        assert isinstance(p, list)
         replayed_val = jnph.replay(f, p)(x1, x2)
         results.append(replayed_val)
 
@@ -496,11 +496,11 @@ def test_path_types():
     assert len(paths) == 4
 
     for p in paths:
-        assert isinstance(p, jnph.BranchPath)
+        assert isinstance(p, list)
         assert len(p) == 1
 
     p0 = paths[0]
-    assert isinstance(p0, jnph.BranchPath)
+    assert isinstance(p0, list)
 
     assert paths[-1] == paths[3]
     assert paths[0] != paths[1]

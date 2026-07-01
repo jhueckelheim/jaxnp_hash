@@ -6,13 +6,6 @@ import jax
 import jax.numpy as jnp
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-if not any(getattr(handler, "_hashtensor_debug_handler", False) for handler in logger.handlers):
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.DEBUG)
-    handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
-    handler._hashtensor_debug_handler = True
-    logger.addHandler(handler)
 
 _is_recording: ContextVar[bool] = ContextVar('_is_recording', default=False)
 _recorded_trace: ContextVar[list] = ContextVar('_recorded_trace', default=[])
@@ -35,6 +28,11 @@ class _TraceNode:
     def __str__(self):
         return self.__repr__()
 
+    def __eq__(self, other):
+        if not isinstance(other, _TraceNode):
+            return NotImplemented
+        return self.name == other.name and self.choices == other.choices
+
     def currentChoice(self):
         choice = self.choices[self.pos]
         logger.debug(f"_TraceNode.currentChoice: name={self.name}, pos={self.pos}, choice={choice}")
@@ -50,31 +48,6 @@ class _TraceNode:
             return True
 
 
-class BranchPath:
-    def __init__(self, nodes):
-        self._nodes = list(nodes)
-
-    def __repr__(self):
-        return f'BranchPath({self._nodes})'
-
-    def __str__(self):
-        return self.__repr__()
-
-    def __len__(self):
-        return len(self._nodes)
-
-    def __iter__(self):
-        return iter(self._nodes)
-
-    def __eq__(self, other):
-        if not isinstance(other, BranchPath):
-            return NotImplemented
-        return PathSet._paths_equal(self, other)
-
-    def __getitem__(self, index):
-        return self._nodes[index]
-
-
 class PathSet:
     def __init__(self, trace, _empty=False):
         self.trace = trace.copy()
@@ -85,7 +58,7 @@ class PathSet:
         if self._empty:
             return
         if not self.trace:
-            yield BranchPath([])
+            yield []
             return
 
         for node in self.trace:
@@ -97,7 +70,7 @@ class PathSet:
             yield self._current_path()
 
     def _current_path(self):
-        return BranchPath([_TraceNode(node.name, [node.currentChoice()]) for node in self.trace])
+        return [_TraceNode(node.name, [node.currentChoice()]) for node in self.trace]
 
     def _increment_trace(self):
         for i in reversed(range(len(self.trace))):
@@ -125,7 +98,7 @@ class PathSet:
             raise IndexError(f"Index {index} is out of range for PathSet with {total_len} elements")
 
         if not self.trace:
-            return BranchPath([])
+            return []
 
         trace_copy = [_TraceNode(node.name, node.choices) for node in self.trace]
 
@@ -138,12 +111,10 @@ class PathSet:
             node.pos = remaining_index // combinations_after
             remaining_index = remaining_index % combinations_after
 
-        return BranchPath([_TraceNode(node.name, [node.currentChoice()]) for node in trace_copy])
+        return [_TraceNode(node.name, [node.currentChoice()]) for node in trace_copy]
 
     def __contains__(self, item):
-        if isinstance(item, BranchPath):
-            nodes = item._nodes
-        elif isinstance(item, list):
+        if isinstance(item, list):
             nodes = item
         else:
             return False
@@ -162,8 +133,8 @@ class PathSet:
 
     @staticmethod
     def _paths_equal(path1, path2):
-        nodes1 = path1._nodes if isinstance(path1, BranchPath) else path1
-        nodes2 = path2._nodes if isinstance(path2, BranchPath) else path2
+        nodes1 = path1
+        nodes2 = path2
         if len(nodes1) != len(nodes2):
             return False
         for node1, node2 in zip(nodes1, nodes2):
@@ -185,8 +156,7 @@ class PathSet:
         return f'PathSet with {len(self)} possible paths from {len(self.trace)} trace nodes'
 
     def _path_to_tuple(self, path):
-        nodes = path._nodes if isinstance(path, BranchPath) else path
-        return tuple((node.name, node.choices[0]) for node in nodes)
+        return tuple((node.name, node.choices[0]) for node in path)
 
     def _create_trace_from_paths(self, path_tuples):
         if not path_tuples:
@@ -249,7 +219,7 @@ class PathSet:
         return self._build_from_tuples(diff_paths)
 
     def format_path(self, path):
-        nodes = path._nodes if isinstance(path, BranchPath) else path
+        nodes = path
         if not nodes:
             return "No decision points"
 
@@ -310,14 +280,12 @@ def _branch_mode(mode, tol=0, replay_path=None):
             if replay_path is None:
                 raise ValueError("replay_path must be provided in replay mode")
 
-            if isinstance(replay_path, BranchPath):
-                _replay_path.set(list(replay_path._nodes))
-            elif isinstance(replay_path, list):
+            if isinstance(replay_path, list):
                 _replay_path.set(list(replay_path))
             elif isinstance(replay_path, PathSet):
                 if len(replay_path) == 1:
                     path = next(iter(replay_path))
-                    _replay_path.set(list(path._nodes))
+                    _replay_path.set(list(path))
                 else:
                     raise ValueError("PathSet with multiple paths cannot be used directly as replay_path. Iterate over it first.")
             else:

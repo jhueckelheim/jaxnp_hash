@@ -1,6 +1,5 @@
 from .HashTensor import (
     HashTensor,
-    BranchPath,
     PathSet,
     record,
     replay,
