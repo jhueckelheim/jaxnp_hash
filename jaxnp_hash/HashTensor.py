@@ -226,8 +226,8 @@ class PathSet:
         lines = []
         for step, node in enumerate(nodes):
             choice_val = node.choices[0]
-            if isinstance(choice_val, tuple) and len(choice_val) == 2:
-                nearby_indices, choice_int = choice_val
+            if isinstance(choice_val, tuple) and len(choice_val) >= 2 and isinstance(choice_val[0], tuple):
+                nearby_indices, choice_int = choice_val[0], choice_val[1]
                 if isinstance(nearby_indices, tuple):
                     if len(nearby_indices) == 0:
                         lines.append(f"  Step {step+1} ({node.name}): standard choice (no nearby values)")
@@ -405,23 +405,24 @@ def _elementwise_minmax(one, two, name, jnp_op, prefer_first):
         nearby_indices = jnp.where(jnp.abs(one.value - two.value) <= _tolerance.get())[0]
         nearby_indices = tuple(int(x) for x in nearby_indices.tolist())
         logger.debug(f"{name}: recording - nearby_indices={nearby_indices}")
+        # Fixed per-index operand identity at record time (True => "two" is the
+        # jnp_op winner). Indices outside nearby_indices are unambiguous, so replay
+        # must keep this identity rather than recomparing at the (different) replay
+        # point -- otherwise replaying this branch at another z silently jumps to
+        # whichever operand wins there, instead of extending the recorded manifold.
+        base_pick_two = tuple(bool(x) for x in (jnp_op(one.value, two.value) == two.value).tolist())
         n_choices = 2 ** len(nearby_indices)
-        choices = [(nearby_indices, i) for i in range(n_choices)]
+        choices = [(nearby_indices, i, base_pick_two) for i in range(n_choices)]
         _trace_append(name, choices)
     else:
-        nearby_indices, choice_int = _trace_popf(name)
+        nearby_indices, choice_int, base_pick_two = _trace_popf(name)
+        pick_two = jnp.array(base_pick_two)
         nearby_indices = jnp.array(nearby_indices)
-        choice = jnp.zeros_like(one.value, dtype=bool)
         for j, idx in enumerate(nearby_indices):
             if (choice_int >> j) & 1:
-                choice = choice.at[idx].set(True)
-        standard = jnp_op(one.value, two.value)
-        if prefer_first:
-            flipped = jnp.where(one.value > two.value, two.value, one.value)
-        else:
-            flipped = jnp.where(one.value < two.value, two.value, one.value)
-        result = HashTensor(jnp.where(choice, flipped, standard))
-        logger.debug(f"{name}: replaying - choice={choice}, result={result.value}")
+                pick_two = pick_two.at[idx].set(jnp.logical_not(pick_two[idx]))
+        result = HashTensor(jnp.where(pick_two, two.value, one.value))
+        logger.debug(f"{name}: replaying - pick_two={pick_two}, result={result.value}")
         return result
     return HashTensor(jnp_op(one.value, two.value))
 
@@ -447,18 +448,25 @@ def abs(inval):
         nearby_indices = jnp.where(jnp.abs(inval.value) <= _tolerance.get())[0]
         nearby_indices = tuple(int(x) for x in nearby_indices.tolist())
         logger.debug(f"abs: recording - nearby_indices={nearby_indices}")
+        # Fixed per-index sign at record time: False => extend with "+z_i", True =>
+        # extend with "-z_i". Indices outside nearby_indices are unambiguous, so
+        # replay must keep this raw linear extension rather than recomputing abs at
+        # the (different) replay point's value -- otherwise replaying this branch at
+        # another z silently reverts to the true abs there, instead of extending the
+        # recorded manifold.
+        base_negate = tuple(bool(x) for x in (inval.value < 0).tolist())
         n_choices = 2 ** len(nearby_indices)
-        choices = [(nearby_indices, i) for i in range(n_choices)]
+        choices = [(nearby_indices, i, base_negate) for i in range(n_choices)]
         logger.debug(f"abs: recording - generated {n_choices} choices")
         _trace_append("abs", choices)
     else:
-        nearby_indices, choice_int = _trace_popf("abs")
+        nearby_indices, choice_int, base_negate = _trace_popf("abs")
+        negate = jnp.array(base_negate)
         nearby_indices = jnp.array(nearby_indices)
-        negate = jnp.zeros_like(inval.value, dtype=bool)
         for j, idx in enumerate(nearby_indices):
             if (choice_int >> j) & 1:
-                negate = negate.at[idx].set(True)
-        result = HashTensor(jnp.where(negate, -jnp.abs(inval.value), jnp.abs(inval.value)))
+                negate = negate.at[idx].set(jnp.logical_not(negate[idx]))
+        result = HashTensor(jnp.where(negate, -inval.value, inval.value))
         logger.debug(f"abs: replaying - negate={negate}, result={result.value}")
         return result
     return HashTensor(jnp.abs(inval.value))
