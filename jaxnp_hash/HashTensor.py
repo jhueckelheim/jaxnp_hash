@@ -416,11 +416,15 @@ def _elementwise_minmax(one, two, name, jnp_op, prefer_first):
         _trace_append(name, choices)
     else:
         nearby_indices, choice_int, base_pick_two = _trace_popf(name)
-        pick_two = jnp.array(base_pick_two)
-        nearby_indices = jnp.array(nearby_indices)
+        # nearby_indices/choice_int/base_pick_two are plain Python values, so the flip
+        # is done as a Python list op -- looping with per-index jnp .at[].set() calls
+        # here was dispatching one uncompiled JAX op per tied index per replay, which
+        # dominated replay cost when several indices tie at once.
+        pick_two = list(base_pick_two)
         for j, idx in enumerate(nearby_indices):
             if (choice_int >> j) & 1:
-                pick_two = pick_two.at[idx].set(jnp.logical_not(pick_two[idx]))
+                pick_two[idx] = not pick_two[idx]
+        pick_two = jnp.array(pick_two)
         result = HashTensor(jnp.where(pick_two, two.value, one.value))
         logger.debug(f"{name}: replaying - pick_two={pick_two}, result={result.value}")
         return result
@@ -461,11 +465,15 @@ def abs(inval):
         _trace_append("abs", choices)
     else:
         nearby_indices, choice_int, base_negate = _trace_popf("abs")
-        negate = jnp.array(base_negate)
-        nearby_indices = jnp.array(nearby_indices)
+        # nearby_indices/choice_int/base_negate are plain Python values, so the flip is
+        # done as a Python list op -- looping with per-index jnp .at[].set() calls here
+        # was dispatching one uncompiled JAX op per tied index per replay, which
+        # dominated replay cost when several indices tie at once.
+        negate = list(base_negate)
         for j, idx in enumerate(nearby_indices):
             if (choice_int >> j) & 1:
-                negate = negate.at[idx].set(jnp.logical_not(negate[idx]))
+                negate[idx] = not negate[idx]
+        negate = jnp.array(negate)
         result = HashTensor(jnp.where(negate, -inval.value, inval.value))
         logger.debug(f"abs: replaying - negate={negate}, result={result.value}")
         return result
@@ -542,10 +550,17 @@ def replay_grad(fun, path, argnums=0, has_aux=False):
     return replayed_grad
 
 
-def replay_value_and_grad(fun, path, argnums=0, has_aux=False):
+def replay_value_and_grad(fun, path, argnums=0, has_aux=False, _jax_vg_fn=None):
+    # _jax_vg_fn lets callers that replay many paths against the same fun (e.g.
+    # all_value_and_grad's per-path loop, h_fun's H0 replay loop) build the
+    # jax.value_and_grad transform once and reuse it, instead of once per path. This
+    # doesn't change tracing/caching behavior -- jax.value_and_grad(fun, ...) itself
+    # does no tracing until called, and each call below still runs eagerly under its
+    # own _branch_mode, so this is exactly equivalent to rebuilding it every call.
+    jax_vg_fn = _jax_vg_fn if _jax_vg_fn is not None else jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)
+
     def replayed_val_grad(*args, **kwargs):
         with _branch_mode("replay", replay_path=path):
-            jax_vg_fn = jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)
             vg_result = jax_vg_fn(*args, **kwargs)
 
         if has_aux:
@@ -560,9 +575,10 @@ def replay_value_and_grad(fun, path, argnums=0, has_aux=False):
 def all_value_and_grad(fun, argnums=0, tol=0.0, has_aux=False):
     def all_vg_fn(*args, **kwargs):
         defaultresult, paths = record(fun, tol=tol)(*args, **kwargs)
+        jax_vg_fn = jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)
         results = []
         for path in paths:
-            vg_fn = replay_value_and_grad(fun, path, argnums=argnums, has_aux=has_aux)
+            vg_fn = replay_value_and_grad(fun, path, argnums=argnums, has_aux=has_aux, _jax_vg_fn=jax_vg_fn)
             results.append(vg_fn(*args, **kwargs))
         return defaultresult, results, paths
     return all_vg_fn
@@ -588,9 +604,10 @@ def h_fun(fun, argnums=0, tol=0.0, has_aux=False):
             J = len(H0)
             h = np.zeros(J, dtype=float)
             grads = np.zeros((z_jax.shape[0], J), dtype=float)
+            jax_vg_fn = jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)
 
             for k, path in enumerate(H0):
-                v, g = replay_value_and_grad(fun, path, argnums=argnums, has_aux=has_aux)(z_jax)
+                v, g = replay_value_and_grad(fun, path, argnums=argnums, has_aux=has_aux, _jax_vg_fn=jax_vg_fn)(z_jax)
                 h[k] = float(v)
                 grads[:, k] = np.asarray(g)
 
