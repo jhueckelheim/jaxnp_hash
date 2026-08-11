@@ -4,6 +4,7 @@ from contextvars import ContextVar
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,7 @@ _tolerance: ContextVar[float] = ContextVar('_tolerance', default=0)
 
 class _TraceNode:
     def __init__(self, name, choices):
-        logger.debug(f"_TraceNode.__init__: name={name}, num_choices={len(choices)}")
+        logger.debug("_TraceNode.__init__: name=%s, num_choices=%s", name, len(choices))
         self.name = name
         self.choices = list(choices)
         self.num = len(self.choices)
@@ -35,11 +36,11 @@ class _TraceNode:
 
     def currentChoice(self):
         choice = self.choices[self.pos]
-        logger.debug(f"_TraceNode.currentChoice: name={self.name}, pos={self.pos}, choice={choice}")
+        logger.debug("_TraceNode.currentChoice: name=%s, pos=%s, choice=%s", self.name, self.pos, choice)
         return choice
 
     def incrementChoice(self):
-        logger.debug(f"_TraceNode.incrementChoice: name={self.name}, pos={self.pos}, num={self.num}")
+        logger.debug("_TraceNode.incrementChoice: name=%s, pos=%s, num=%s", self.name, self.pos, self.num)
         if self.pos + 1 >= self.num:
             self.pos = 0
             return False
@@ -52,7 +53,7 @@ class PathSet:
     def __init__(self, trace, _empty=False):
         self.trace = trace.copy()
         self._empty = _empty
-        logger.debug(f"PathSet.__init__: trace with {len(trace)} nodes")
+        logger.debug("PathSet.__init__: trace with %s nodes", len(trace))
 
     def __iter__(self):
         if self._empty:
@@ -255,7 +256,7 @@ class PathSet:
 
 @contextmanager
 def _branch_mode(mode, tol=0, replay_path=None):
-    logger.debug(f"Entering _branch_mode: mode={mode}, tolerance={tol}")
+    logger.debug("Entering _branch_mode: mode=%s, tolerance=%s", mode, tol)
 
     rec_token = _is_recording.set(False)
     trace_token = _recorded_trace.set([])
@@ -307,7 +308,7 @@ def _branch_mode(mode, tol=0, replay_path=None):
 
 def _trace_append(name, choices):
     trace = _recorded_trace.get()
-    logger.debug(f"_trace_append: name={name}, num_choices={len(choices)}")
+    logger.debug("_trace_append: name=%s, num_choices=%s", name, len(choices))
     trace.append(_TraceNode(name, choices))
 
 
@@ -327,7 +328,7 @@ def _trace_popf(name):
 
 class HashTensor:
     def __init__(self, value):
-        logger.debug(f"HashTensor.__init__: value={value}")
+        logger.debug("HashTensor.__init__: value=%s", value)
         self.value = value
 
     def __repr__(self):
@@ -368,43 +369,43 @@ class HashTensor:
 
 
 def max(inval):
-    logger.debug(f"max: input={inval.value}")
+    logger.debug("max: input=%s", inval.value)
     if _is_recording.get():
         loc = jnp.argmax(inval.value)
         val = inval.value[loc]
         nearby_locs, = jnp.where(inval.value >= val - _tolerance.get())
         nearby_locs = tuple(int(x) for x in nearby_locs.tolist())
-        logger.debug(f"max: recording - loc={loc}, val={val}, nearby_locs={nearby_locs}")
+        logger.debug("max: recording - loc=%s, val=%s, nearby_locs=%s", loc, val, nearby_locs)
         _trace_append("max", nearby_locs)
     else:
         loc = _trace_popf("max")
         val = inval.value[loc]
-        logger.debug(f"max: replaying - loc={loc}, val={val}")
+        logger.debug("max: replaying - loc=%s, val=%s", loc, val)
     return HashTensor(val)
 
 
 def min(inval):
-    logger.debug(f"min: input={inval.value}")
+    logger.debug("min: input=%s", inval.value)
     if _is_recording.get():
         loc = jnp.argmin(inval.value)
         val = inval.value[loc]
         nearby_locs, = jnp.where(inval.value <= val + _tolerance.get())
         nearby_locs = tuple(int(x) for x in nearby_locs.tolist())
-        logger.debug(f"min: recording - loc={loc}, val={val}, nearby_locs={nearby_locs}")
+        logger.debug("min: recording - loc=%s, val=%s, nearby_locs=%s", loc, val, nearby_locs)
         _trace_append("min", nearby_locs)
     else:
         loc = _trace_popf("min")
         val = inval.value[loc]
-        logger.debug(f"min: replaying - loc={loc}, val={val}")
+        logger.debug("min: replaying - loc=%s, val=%s", loc, val)
     return HashTensor(val)
 
 
 def _elementwise_minmax(one, two, name, jnp_op, prefer_first):
-    logger.debug(f"{name}: one={one.value}, two={two.value}")
+    logger.debug("%s: one=%s, two=%s", name, one.value, two.value)
     if _is_recording.get():
         nearby_indices = jnp.where(jnp.abs(one.value - two.value) <= _tolerance.get())[0]
         nearby_indices = tuple(int(x) for x in nearby_indices.tolist())
-        logger.debug(f"{name}: recording - nearby_indices={nearby_indices}")
+        logger.debug("%s: recording - nearby_indices=%s", name, nearby_indices)
         # Fixed per-index operand identity at record time (True => "two" is the
         # jnp_op winner). Indices outside nearby_indices are unambiguous, so replay
         # must keep this identity rather than recomparing at the (different) replay
@@ -424,9 +425,12 @@ def _elementwise_minmax(one, two, name, jnp_op, prefer_first):
         for j, idx in enumerate(nearby_indices):
             if (choice_int >> j) & 1:
                 pick_two[idx] = not pick_two[idx]
-        pick_two = jnp.array(pick_two)
+        # Plain numpy here (not jnp.array): pick_two is a constant boolean mask, never
+        # differentiated, and jnp.array would dispatch an explicit host->device put; a
+        # numpy array is broadcast into jnp.where without that extra dispatch.
+        pick_two = np.array(pick_two)
         result = HashTensor(jnp.where(pick_two, two.value, one.value))
-        logger.debug(f"{name}: replaying - pick_two={pick_two}, result={result.value}")
+        logger.debug("%s: replaying - pick_two=%s, result=%s", name, pick_two, result.value)
         return result
     return HashTensor(jnp_op(one.value, two.value))
 
@@ -440,18 +444,18 @@ def minimum(one, two):
 
 
 def sum(inval):
-    logger.debug(f"sum: input={inval.value}")
+    logger.debug("sum: input=%s", inval.value)
     result = HashTensor(jnp.sum(inval.value))
-    logger.debug(f"sum: result={result.value}")
+    logger.debug("sum: result=%s", result.value)
     return result
 
 
 def abs(inval):
-    logger.debug(f"abs: input={inval.value}")
+    logger.debug("abs: input=%s", inval.value)
     if _is_recording.get():
         nearby_indices = jnp.where(jnp.abs(inval.value) <= _tolerance.get())[0]
         nearby_indices = tuple(int(x) for x in nearby_indices.tolist())
-        logger.debug(f"abs: recording - nearby_indices={nearby_indices}")
+        logger.debug("abs: recording - nearby_indices=%s", nearby_indices)
         # Fixed per-index sign at record time: False => extend with "+z_i", True =>
         # extend with "-z_i". Indices outside nearby_indices are unambiguous, so
         # replay must keep this raw linear extension rather than recomputing abs at
@@ -461,7 +465,7 @@ def abs(inval):
         base_negate = tuple(bool(x) for x in (inval.value < 0).tolist())
         n_choices = 2 ** len(nearby_indices)
         choices = [(nearby_indices, i, base_negate) for i in range(n_choices)]
-        logger.debug(f"abs: recording - generated {n_choices} choices")
+        logger.debug("abs: recording - generated %s choices", n_choices)
         _trace_append("abs", choices)
     else:
         nearby_indices, choice_int, base_negate = _trace_popf("abs")
@@ -473,9 +477,12 @@ def abs(inval):
         for j, idx in enumerate(nearby_indices):
             if (choice_int >> j) & 1:
                 negate[idx] = not negate[idx]
-        negate = jnp.array(negate)
+        # Plain numpy here (not jnp.array): negate is a constant boolean mask, never
+        # differentiated, and jnp.array would dispatch an explicit host->device put; a
+        # numpy array is broadcast into jnp.where without that extra dispatch.
+        negate = np.array(negate)
         result = HashTensor(jnp.where(negate, -inval.value, inval.value))
-        logger.debug(f"abs: replaying - negate={negate}, result={result.value}")
+        logger.debug("abs: replaying - negate=%s, result=%s", negate, result.value)
         return result
     return HashTensor(jnp.abs(inval.value))
 
@@ -585,7 +592,6 @@ def all_value_and_grad(fun, argnums=0, tol=0.0, has_aux=False):
 
 
 def h_fun(fun, argnums=0, tol=0.0, has_aux=False):
-    import numpy as np
 
     def wrapped(z, H0=None):
         z_jax = jnp.asarray(z)
