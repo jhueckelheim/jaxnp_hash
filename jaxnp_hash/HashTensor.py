@@ -249,7 +249,16 @@ class PathSet:
         lines = []
         for step, node in enumerate(nodes):
             choice_val = node.choices[0]
-            if isinstance(choice_val, tuple) and len(choice_val) >= 2 and isinstance(choice_val[0], tuple):
+            if isinstance(choice_val, tuple) and len(choice_val) == 2 and isinstance(choice_val[0], tuple) and isinstance(choice_val[1], tuple):
+                # abs()'s collapsed choice: (nearby_indices, base_negate) -- there's
+                # only ever one choice now, so there's nothing to report beyond which
+                # indices were ambiguous (zero-gradient) at record time.
+                nearby_indices, _base_negate = choice_val
+                if len(nearby_indices) == 0:
+                    lines.append(f"  Step {step+1} ({node.name}): standard absolute value (no ambiguous indices)")
+                else:
+                    lines.append(f"  Step {step+1} ({node.name}): ambiguous (zero-grad) indices {list(nearby_indices)}")
+            elif isinstance(choice_val, tuple) and len(choice_val) >= 2 and isinstance(choice_val[0], tuple):
                 nearby_indices, choice_int = choice_val[0], choice_val[1]
                 if isinstance(nearby_indices, tuple):
                     if len(nearby_indices) == 0:
@@ -541,6 +550,32 @@ def sum(inval):
     return result
 
 
+def _abs_from_choice(value, nearby_indices, base_negate):
+    # Unambiguous components (outside nearby_indices) extend the recorded linear piece
+    # with their fixed recorded sign -- gradient is the constant recorded sign, and
+    # replaying at a different z intentionally does NOT recompute the sign there (see
+    # note below). Ambiguous (near-zero-at-record-time) components instead collapse to
+    # a single zero-gradient choice, matching the hand-coded h_one_norm's "0" hash
+    # (general_nonsmooth_h_funs.py) rather than enumerating all 2**len(nearby_indices)
+    # sign combinations -- that enumeration is exact but intractable once more than a
+    # handful of components tie, and (per that hand-coded implementation's own
+    # comment) the exactness doesn't matter for the convex-hull criticality
+    # calculation manifold sampling actually needs.
+    negate = np.array(base_negate)
+    ambiguous = np.zeros(len(base_negate), dtype=bool)
+    if len(nearby_indices) > 0:
+        ambiguous[np.array(nearby_indices, dtype=np.intp)] = True
+
+    linear_part = jnp.where(negate, -value, value)
+    # stop_gradient keeps the forward value as the true current abs() (so ambiguous
+    # components are always reported correctly), while forcing their gradient
+    # contribution to exactly 0 -- jnp.where's gradient only flows through the branch
+    # each element selected, so this leaves unambiguous components' ±1 gradient
+    # untouched.
+    zero_grad_part = jax.lax.stop_gradient(jnp.abs(value))
+    return jnp.where(ambiguous, zero_grad_part, linear_part)
+
+
 def abs(inval):
     logger.debug("abs: input=%s", inval.value)
     if _is_recording.get():
@@ -554,48 +589,27 @@ def abs(inval):
         # another z silently reverts to the true abs there, instead of extending the
         # recorded manifold.
         base_negate = tuple(bool(x) for x in (inval.value < 0).tolist())
-        n_choices = 2 ** len(nearby_indices)
-        choices = [(nearby_indices, i, base_negate) for i in range(n_choices)]
-        logger.debug("abs: recording - generated %s choices", n_choices)
+        # Exactly one choice regardless of len(nearby_indices) -- see
+        # _abs_from_choice's docstring-comment for why we don't enumerate sign
+        # combinations for ambiguous components.
+        choices = [(nearby_indices, base_negate)]
         _trace_append("abs", choices)
+        result = HashTensor(_abs_from_choice(inval.value, nearby_indices, base_negate))
+        logger.debug("abs: recording - result=%s", result.value)
+        return result
     elif _is_vmap_replay.get():
-        node, selector = _trace_popf_vmap("abs")
-        nearby_indices, _, base_negate = node.choices[0]
-        # nearby_indices/base_negate are the SAME across every choice of this node
-        # (only the middle "choice_int" element differs) -- fixed closure constants.
-        # selector (a traced, batched scalar under vmap) plays the role choice_int
-        # played in the plain-replay branch below, but the bit-unpacking has to be
-        # pure jnp ops (one vectorized scatter) instead of a Python loop, since a
-        # traced value can't drive Python-level control flow or list mutation.
-        m = len(base_negate)
-        # dtype=np.intp: np.array(()) defaults to float64, which .at[].set() rejects
-        # as an indexer -- an empty nearby_indices (no ties) must stay integer-typed.
-        nearby_arr = np.array(nearby_indices, dtype=np.intp)
-        base_arr = np.array(base_negate)
-        bits = (selector >> jnp.arange(len(nearby_indices))) & 1
-        flip = jnp.zeros(m, dtype=bool).at[nearby_arr].set(bits.astype(bool))
-        negate = jnp.logical_xor(base_arr, flip)
-        result = HashTensor(jnp.where(negate, -inval.value, inval.value))
-        logger.debug("abs: vmap replaying - negate=%s, result=%s", negate, result.value)
+        node, _selector = _trace_popf_vmap("abs")
+        nearby_indices, base_negate = node.choices[0]
+        # No selector-driven branch selection needed anymore -- there's only ever one
+        # choice per node now, so every batch element uses the same formula.
+        result = HashTensor(_abs_from_choice(inval.value, nearby_indices, base_negate))
+        logger.debug("abs: vmap replaying - result=%s", result.value)
         return result
     else:
-        nearby_indices, choice_int, base_negate = _trace_popf("abs")
-        # nearby_indices/choice_int/base_negate are plain Python values, so the flip is
-        # done as a Python list op -- looping with per-index jnp .at[].set() calls here
-        # was dispatching one uncompiled JAX op per tied index per replay, which
-        # dominated replay cost when several indices tie at once.
-        negate = list(base_negate)
-        for j, idx in enumerate(nearby_indices):
-            if (choice_int >> j) & 1:
-                negate[idx] = not negate[idx]
-        # Plain numpy here (not jnp.array): negate is a constant boolean mask, never
-        # differentiated, and jnp.array would dispatch an explicit host->device put; a
-        # numpy array is broadcast into jnp.where without that extra dispatch.
-        negate = np.array(negate)
-        result = HashTensor(jnp.where(negate, -inval.value, inval.value))
-        logger.debug("abs: replaying - negate=%s, result=%s", negate, result.value)
+        nearby_indices, base_negate = _trace_popf("abs")
+        result = HashTensor(_abs_from_choice(inval.value, nearby_indices, base_negate))
+        logger.debug("abs: replaying - result=%s", result.value)
         return result
-    return HashTensor(jnp.abs(inval.value))
 
 
 def record(fun, tol=0.0):
