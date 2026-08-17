@@ -3,6 +3,7 @@ import jax.numpy as _jnp
 
 from .HashTensor import (
     _is_recording,
+    _is_vmap_replay,
     _replay_path,
     HashTensor,
     max as _ht_max,
@@ -15,7 +16,7 @@ from .HashTensor import (
 
 
 def _is_active():
-    return _is_recording.get() or _replay_path.get() is not None
+    return _is_recording.get() or _replay_path.get() is not None or _is_vmap_replay.get()
 
 
 def _unwrap(val):

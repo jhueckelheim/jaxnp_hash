@@ -13,6 +13,9 @@ _recorded_trace: ContextVar[list] = ContextVar('_recorded_trace', default=[])
 _replay_path: ContextVar[list] = ContextVar('_replay_path', default=None)
 _replay_pos: ContextVar[int] = ContextVar('_replay_pos', default=0)
 _tolerance: ContextVar[float] = ContextVar('_tolerance', default=0)
+_is_vmap_replay: ContextVar[bool] = ContextVar('_is_vmap_replay', default=False)
+_vmap_trace: ContextVar[list] = ContextVar('_vmap_trace', default=None)
+_vmap_selectors: ContextVar[tuple] = ContextVar('_vmap_selectors', default=None)
 
 
 class _TraceNode:
@@ -78,6 +81,21 @@ class PathSet:
             if self.trace[i].incrementChoice():
                 return True
         return False
+
+    def _iter_positions(self):
+        if self._empty:
+            return
+        if not self.trace:
+            yield ()
+            return
+
+        for node in self.trace:
+            node.pos = 0
+
+        yield tuple(node.pos for node in self.trace)
+
+        while self._increment_trace():
+            yield tuple(node.pos for node in self.trace)
 
     def __len__(self):
         if self._empty:
@@ -255,7 +273,7 @@ class PathSet:
 
 
 @contextmanager
-def _branch_mode(mode, tol=0, replay_path=None):
+def _branch_mode(mode, tol=0, replay_path=None, trace=None, selectors=None):
     logger.debug("Entering _branch_mode: mode=%s, tolerance=%s", mode, tol)
 
     rec_token = _is_recording.set(False)
@@ -263,6 +281,9 @@ def _branch_mode(mode, tol=0, replay_path=None):
     path_token = _replay_path.set(None)
     pos_token = _replay_pos.set(0)
     tol_token = _tolerance.set(0)
+    vmap_flag_token = _is_vmap_replay.set(False)
+    vmap_trace_token = _vmap_trace.set(None)
+    vmap_sel_token = _vmap_selectors.set(None)
 
     try:
         if mode == "record":
@@ -295,6 +316,17 @@ def _branch_mode(mode, tol=0, replay_path=None):
             _replay_pos.set(0)
             logger.debug("Starting replay mode")
             yield
+
+        elif mode == "vmap_replay":
+            if trace is None or selectors is None:
+                raise ValueError("trace and selectors must be provided in vmap_replay mode")
+
+            _is_vmap_replay.set(True)
+            _vmap_trace.set(trace)
+            _vmap_selectors.set(tuple(selectors))
+            _replay_pos.set(0)
+            logger.debug("Starting vmap_replay mode")
+            yield
         else:
             raise Exception(f"Unexpected branch recording mode {mode}.")
     finally:
@@ -303,6 +335,9 @@ def _branch_mode(mode, tol=0, replay_path=None):
         _replay_path.reset(path_token)
         _replay_pos.reset(pos_token)
         _tolerance.reset(tol_token)
+        _is_vmap_replay.reset(vmap_flag_token)
+        _vmap_trace.reset(vmap_trace_token)
+        _vmap_selectors.reset(vmap_sel_token)
         logger.debug("Exiting _branch_mode")
 
 
@@ -324,6 +359,22 @@ def _trace_popf(name):
     if node.name != name:
         raise ValueError(f"Expected trace node {name}, got {node.name}")
     return node.choices[0]
+
+
+def _trace_popf_vmap(name):
+    trace = _vmap_trace.get()
+    pos = _replay_pos.get()
+    selectors = _vmap_selectors.get()
+    if trace is None:
+        raise ValueError("No trace provided for vmap_replay mode")
+    if pos >= len(trace):
+        raise ValueError("Path exhausted")
+    node = trace[pos]
+    selector = selectors[pos]
+    _replay_pos.set(pos + 1)
+    if node.name != name:
+        raise ValueError(f"Expected trace node {name}, got {node.name}")
+    return node, selector
 
 
 class HashTensor:
@@ -377,6 +428,12 @@ def max(inval):
         nearby_locs = tuple(int(x) for x in nearby_locs.tolist())
         logger.debug("max: recording - loc=%s, val=%s, nearby_locs=%s", loc, val, nearby_locs)
         _trace_append("max", nearby_locs)
+    elif _is_vmap_replay.get():
+        node, selector = _trace_popf_vmap("max")
+        nearby_locs_arr = jnp.asarray(node.choices)
+        loc = nearby_locs_arr[selector]
+        val = inval.value[loc]
+        logger.debug("max: vmap replaying - loc=%s, val=%s", loc, val)
     else:
         loc = _trace_popf("max")
         val = inval.value[loc]
@@ -393,6 +450,12 @@ def min(inval):
         nearby_locs = tuple(int(x) for x in nearby_locs.tolist())
         logger.debug("min: recording - loc=%s, val=%s, nearby_locs=%s", loc, val, nearby_locs)
         _trace_append("min", nearby_locs)
+    elif _is_vmap_replay.get():
+        node, selector = _trace_popf_vmap("min")
+        nearby_locs_arr = jnp.asarray(node.choices)
+        loc = nearby_locs_arr[selector]
+        val = inval.value[loc]
+        logger.debug("min: vmap replaying - loc=%s, val=%s", loc, val)
     else:
         loc = _trace_popf("min")
         val = inval.value[loc]
@@ -410,6 +473,18 @@ def _elementwise_minmax(one, two, name, jnp_op, prefer_first):
         n_choices = 2 ** len(nearby_indices)
         choices = [(nearby_indices, i, base_pick_two) for i in range(n_choices)]
         _trace_append(name, choices)
+    elif _is_vmap_replay.get():
+        node, selector = _trace_popf_vmap(name)
+        nearby_indices, _, base_pick_two = node.choices[0]
+        m = len(base_pick_two)
+        nearby_arr = np.array(nearby_indices, dtype=np.intp)
+        base_arr = np.array(base_pick_two)
+        bits = (selector >> jnp.arange(len(nearby_indices))) & 1
+        flip = jnp.zeros(m, dtype=bool).at[nearby_arr].set(bits.astype(bool))
+        pick_two = jnp.logical_xor(base_arr, flip)
+        result = HashTensor(jnp.where(pick_two, two.value, one.value))
+        logger.debug("%s: vmap replaying - pick_two=%s, result=%s", name, pick_two, result.value)
+        return result
     else:
         nearby_indices, choice_int, base_pick_two = _trace_popf(name)
         pick_two = list(base_pick_two)
@@ -449,6 +524,18 @@ def abs(inval):
         choices = [(nearby_indices, i, base_negate) for i in range(n_choices)]
         logger.debug("abs: recording - generated %s choices", n_choices)
         _trace_append("abs", choices)
+    elif _is_vmap_replay.get():
+        node, selector = _trace_popf_vmap("abs")
+        nearby_indices, _, base_negate = node.choices[0]
+        m = len(base_negate)
+        nearby_arr = np.array(nearby_indices, dtype=np.intp)
+        base_arr = np.array(base_negate)
+        bits = (selector >> jnp.arange(len(nearby_indices))) & 1
+        flip = jnp.zeros(m, dtype=bool).at[nearby_arr].set(bits.astype(bool))
+        negate = jnp.logical_xor(base_arr, flip)
+        result = HashTensor(jnp.where(negate, -inval.value, inval.value))
+        logger.debug("abs: vmap replaying - negate=%s, result=%s", negate, result.value)
+        return result
     else:
         nearby_indices, choice_int, base_negate = _trace_popf("abs")
         negate = list(base_negate)
@@ -551,11 +638,42 @@ def replay_value_and_grad(fun, path, argnums=0, has_aux=False, _jax_vg_fn=None):
 def all_value_and_grad(fun, argnums=0, tol=0.0, has_aux=False):
     def all_vg_fn(*args, **kwargs):
         defaultresult, paths = record(fun, tol=tol)(*args, **kwargs)
-        jax_vg_fn = jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)
+
+        if kwargs or not paths.trace:
+            jax_vg_fn = jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)
+            results = []
+            for path in paths:
+                vg_fn = replay_value_and_grad(fun, path, argnums=argnums, has_aux=has_aux, _jax_vg_fn=jax_vg_fn)
+                results.append(vg_fn(*args, **kwargs))
+            return defaultresult, results, paths
+
+        n_args = len(args)
+        n_nodes = len(paths.trace)
+        positions = list(paths._iter_positions())
+        n_paths = len(positions)
+        selector_arrays = [jnp.asarray([pos[i] for pos in positions], dtype=jnp.int32) for i in range(n_nodes)]
+
+        def vmap_body(*inner_args):
+            call_args = inner_args[:n_args]
+            selectors = inner_args[n_args:]
+            with _branch_mode("vmap_replay", trace=paths.trace, selectors=selectors):
+                return fun(*call_args)
+
+        jax_vg_fn = jax.value_and_grad(vmap_body, argnums=argnums, has_aux=has_aux)
+        vmap_vg_fn = jax.vmap(jax_vg_fn, in_axes=(None,) * n_args + (0,) * n_nodes)
+        vg_out = vmap_vg_fn(*args, *selector_arrays)
+
         results = []
-        for path in paths:
-            vg_fn = replay_value_and_grad(fun, path, argnums=argnums, has_aux=has_aux, _jax_vg_fn=jax_vg_fn)
-            results.append(vg_fn(*args, **kwargs))
+        if has_aux:
+            (values, aux), grads = vg_out
+            for k in range(n_paths):
+                aux_k = jax.tree_util.tree_map(lambda a, k=k: a[k], aux)
+                results.append((values[k], grads[k], aux_k))
+        else:
+            values, grads = vg_out
+            for k in range(n_paths):
+                results.append((values[k], grads[k]))
+
         return defaultresult, results, paths
     return all_vg_fn
 
