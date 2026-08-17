@@ -406,28 +406,16 @@ def _elementwise_minmax(one, two, name, jnp_op, prefer_first):
         nearby_indices = jnp.where(jnp.abs(one.value - two.value) <= _tolerance.get())[0]
         nearby_indices = tuple(int(x) for x in nearby_indices.tolist())
         logger.debug("%s: recording - nearby_indices=%s", name, nearby_indices)
-        # Fixed per-index operand identity at record time (True => "two" is the
-        # jnp_op winner). Indices outside nearby_indices are unambiguous, so replay
-        # must keep this identity rather than recomparing at the (different) replay
-        # point -- otherwise replaying this branch at another z silently jumps to
-        # whichever operand wins there, instead of extending the recorded manifold.
         base_pick_two = tuple(bool(x) for x in (jnp_op(one.value, two.value) == two.value).tolist())
         n_choices = 2 ** len(nearby_indices)
         choices = [(nearby_indices, i, base_pick_two) for i in range(n_choices)]
         _trace_append(name, choices)
     else:
         nearby_indices, choice_int, base_pick_two = _trace_popf(name)
-        # nearby_indices/choice_int/base_pick_two are plain Python values, so the flip
-        # is done as a Python list op -- looping with per-index jnp .at[].set() calls
-        # here was dispatching one uncompiled JAX op per tied index per replay, which
-        # dominated replay cost when several indices tie at once.
         pick_two = list(base_pick_two)
         for j, idx in enumerate(nearby_indices):
             if (choice_int >> j) & 1:
                 pick_two[idx] = not pick_two[idx]
-        # Plain numpy here (not jnp.array): pick_two is a constant boolean mask, never
-        # differentiated, and jnp.array would dispatch an explicit host->device put; a
-        # numpy array is broadcast into jnp.where without that extra dispatch.
         pick_two = np.array(pick_two)
         result = HashTensor(jnp.where(pick_two, two.value, one.value))
         logger.debug("%s: replaying - pick_two=%s, result=%s", name, pick_two, result.value)
@@ -456,12 +444,6 @@ def abs(inval):
         nearby_indices = jnp.where(jnp.abs(inval.value) <= _tolerance.get())[0]
         nearby_indices = tuple(int(x) for x in nearby_indices.tolist())
         logger.debug("abs: recording - nearby_indices=%s", nearby_indices)
-        # Fixed per-index sign at record time: False => extend with "+z_i", True =>
-        # extend with "-z_i". Indices outside nearby_indices are unambiguous, so
-        # replay must keep this raw linear extension rather than recomputing abs at
-        # the (different) replay point's value -- otherwise replaying this branch at
-        # another z silently reverts to the true abs there, instead of extending the
-        # recorded manifold.
         base_negate = tuple(bool(x) for x in (inval.value < 0).tolist())
         n_choices = 2 ** len(nearby_indices)
         choices = [(nearby_indices, i, base_negate) for i in range(n_choices)]
@@ -469,17 +451,10 @@ def abs(inval):
         _trace_append("abs", choices)
     else:
         nearby_indices, choice_int, base_negate = _trace_popf("abs")
-        # nearby_indices/choice_int/base_negate are plain Python values, so the flip is
-        # done as a Python list op -- looping with per-index jnp .at[].set() calls here
-        # was dispatching one uncompiled JAX op per tied index per replay, which
-        # dominated replay cost when several indices tie at once.
         negate = list(base_negate)
         for j, idx in enumerate(nearby_indices):
             if (choice_int >> j) & 1:
                 negate[idx] = not negate[idx]
-        # Plain numpy here (not jnp.array): negate is a constant boolean mask, never
-        # differentiated, and jnp.array would dispatch an explicit host->device put; a
-        # numpy array is broadcast into jnp.where without that extra dispatch.
         negate = np.array(negate)
         result = HashTensor(jnp.where(negate, -inval.value, inval.value))
         logger.debug("abs: replaying - negate=%s, result=%s", negate, result.value)
@@ -558,12 +533,6 @@ def replay_grad(fun, path, argnums=0, has_aux=False):
 
 
 def replay_value_and_grad(fun, path, argnums=0, has_aux=False, _jax_vg_fn=None):
-    # _jax_vg_fn lets callers that replay many paths against the same fun (e.g.
-    # all_value_and_grad's per-path loop, h_fun's H0 replay loop) build the
-    # jax.value_and_grad transform once and reuse it, instead of once per path. This
-    # doesn't change tracing/caching behavior -- jax.value_and_grad(fun, ...) itself
-    # does no tracing until called, and each call below still runs eagerly under its
-    # own _branch_mode, so this is exactly equivalent to rebuilding it every call.
     jax_vg_fn = _jax_vg_fn if _jax_vg_fn is not None else jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)
 
     def replayed_val_grad(*args, **kwargs):
