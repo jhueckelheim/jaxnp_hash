@@ -109,10 +109,6 @@ def test_minimum():
 
 
 def test_abs():
-    # abs() collapses ALL near-zero ("ambiguous") components into a single choice with
-    # zero gradient, rather than enumerating 2**(#ambiguous) sign combinations -- this
-    # mirrors the hand-coded h_one_norm's "0" hash (general_nonsmooth_h_funs.py) and
-    # keeps abs() usable for large vectors with many simultaneous near-zero components.
     def f(x):
         return jnph_np.abs(x)
 
@@ -143,25 +139,16 @@ def test_abs():
 
 
 def test_abs_ambiguous_gradient_is_zero():
-    # Component 0 is ambiguous (within tol of 0); components 1 and 2 are not.
     def f(x):
         return jnph_np.sum(jnph_np.abs(x))
 
     x = jnp.array([0.05, -2.0, 2.5])
     g, paths = jnph.grad(f, tol=0.1)(x)
     assert len(paths) == 1
-    # Ambiguous component's gradient is forced to 0; unambiguous components keep
-    # their true sign gradient.
     assert jnp.allclose(g, jnp.array([0.0, -1.0, 1.0]))
 
 
 def test_abs_replay_at_different_point():
-    # Replaying the recorded manifold at a NEW point z' should:
-    #  - extend unambiguous components linearly with their RECORDED sign (which can
-    #    disagree with the true sign at z', unlike a fresh abs()), and
-    #  - recompute ambiguous components as a fresh, correct, non-negative abs(z'_i)
-    #    with zero gradient -- exactly matching general_nonsmooth_h_funs.py's H0-replay
-    #    branch (lines 77-90) for h_one_norm.
     def f(x):
         return jnph_np.abs(x)
 
@@ -169,13 +156,10 @@ def test_abs_replay_at_different_point():
     _, paths = jnph.record(f, tol=0.1)(x)
     path = paths[0]
 
-    # Flip component 1's sign at the new point: recorded sign was negative, so the
-    # linear extension should report a NEGATIVE value here (not the true abs).
     x_prime = jnp.array([0.03, 2.0, 2.5])
     replayed = jnph.replay(f, path)(x_prime)
     assert jnp.allclose(replayed, jnp.array([0.03, -2.0, 2.5]))
 
-    # replay_value_and_grad expects a scalar-valued function; use sum(abs(x)).
     def f_sum(x):
         return jnph_np.sum(jnph_np.abs(x))
 

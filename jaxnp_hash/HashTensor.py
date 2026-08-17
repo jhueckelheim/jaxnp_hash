@@ -83,10 +83,6 @@ class PathSet:
         return False
 
     def _iter_positions(self):
-        # Mirrors __iter__/_increment_trace exactly, but yields the raw per-node
-        # `pos` tuple instead of materializing _TraceNode copies -- used to build
-        # vmap batch-selector arrays in the SAME path order/identity that __iter__
-        # already guarantees (in particular, which path is index 0/"default").
         if self._empty:
             return
         if not self.trace:
@@ -250,9 +246,6 @@ class PathSet:
         for step, node in enumerate(nodes):
             choice_val = node.choices[0]
             if isinstance(choice_val, tuple) and len(choice_val) == 2 and isinstance(choice_val[0], tuple) and isinstance(choice_val[1], tuple):
-                # abs()'s collapsed choice: (nearby_indices, base_negate) -- there's
-                # only ever one choice now, so there's nothing to report beyond which
-                # indices were ambiguous (zero-gradient) at record time.
                 nearby_indices, _base_negate = choice_val
                 if len(nearby_indices) == 0:
                     lines.append(f"  Step {step+1} ({node.name}): standard absolute value (no ambiguous indices)")
@@ -443,8 +436,6 @@ def max(inval):
         _trace_append("max", nearby_locs)
     elif _is_vmap_replay.get():
         node, selector = _trace_popf_vmap("max")
-        # node.choices is the recorded tuple of tied indices; selector (a traced,
-        # batched scalar under vmap) indexes into it -- one gather, no Python branch.
         nearby_locs_arr = jnp.asarray(node.choices)
         loc = nearby_locs_arr[selector]
         val = inval.value[loc]
@@ -467,8 +458,6 @@ def min(inval):
         _trace_append("min", nearby_locs)
     elif _is_vmap_replay.get():
         node, selector = _trace_popf_vmap("min")
-        # node.choices is the recorded tuple of tied indices; selector (a traced,
-        # batched scalar under vmap) indexes into it -- one gather, no Python branch.
         nearby_locs_arr = jnp.asarray(node.choices)
         loc = nearby_locs_arr[selector]
         val = inval.value[loc]
@@ -486,11 +475,6 @@ def _elementwise_minmax(one, two, name, jnp_op, prefer_first):
         nearby_indices = jnp.where(jnp.abs(one.value - two.value) <= _tolerance.get())[0]
         nearby_indices = tuple(int(x) for x in nearby_indices.tolist())
         logger.debug("%s: recording - nearby_indices=%s", name, nearby_indices)
-        # Fixed per-index operand identity at record time (True => "two" is the
-        # jnp_op winner). Indices outside nearby_indices are unambiguous, so replay
-        # must keep this identity rather than recomparing at the (different) replay
-        # point -- otherwise replaying this branch at another z silently jumps to
-        # whichever operand wins there, instead of extending the recorded manifold.
         base_pick_two = tuple(bool(x) for x in (jnp_op(one.value, two.value) == two.value).tolist())
         n_choices = 2 ** len(nearby_indices)
         choices = [(nearby_indices, i, base_pick_two) for i in range(n_choices)]
@@ -498,15 +482,7 @@ def _elementwise_minmax(one, two, name, jnp_op, prefer_first):
     elif _is_vmap_replay.get():
         node, selector = _trace_popf_vmap(name)
         nearby_indices, _, base_pick_two = node.choices[0]
-        # nearby_indices/base_pick_two are the SAME across every choice of this node
-        # (only the middle "choice_int" element differs) -- fixed closure constants.
-        # selector (a traced, batched scalar under vmap) plays the role choice_int
-        # played in the plain-replay branch below, but the bit-unpacking has to be
-        # pure jnp ops (one vectorized scatter) instead of a Python loop, since a
-        # traced value can't drive Python-level control flow or list mutation.
         m = len(base_pick_two)
-        # dtype=np.intp: np.array(()) defaults to float64, which .at[].set() rejects
-        # as an indexer -- an empty nearby_indices (no ties) must stay integer-typed.
         nearby_arr = np.array(nearby_indices, dtype=np.intp)
         base_arr = np.array(base_pick_two)
         bits = (selector >> jnp.arange(len(nearby_indices))) & 1
@@ -517,17 +493,10 @@ def _elementwise_minmax(one, two, name, jnp_op, prefer_first):
         return result
     else:
         nearby_indices, choice_int, base_pick_two = _trace_popf(name)
-        # nearby_indices/choice_int/base_pick_two are plain Python values, so the flip
-        # is done as a Python list op -- looping with per-index jnp .at[].set() calls
-        # here was dispatching one uncompiled JAX op per tied index per replay, which
-        # dominated replay cost when several indices tie at once.
         pick_two = list(base_pick_two)
         for j, idx in enumerate(nearby_indices):
             if (choice_int >> j) & 1:
                 pick_two[idx] = not pick_two[idx]
-        # Plain numpy here (not jnp.array): pick_two is a constant boolean mask, never
-        # differentiated, and jnp.array would dispatch an explicit host->device put; a
-        # numpy array is broadcast into jnp.where without that extra dispatch.
         pick_two = np.array(pick_two)
         result = HashTensor(jnp.where(pick_two, two.value, one.value))
         logger.debug("%s: replaying - pick_two=%s, result=%s", name, pick_two, result.value)
@@ -551,27 +520,12 @@ def sum(inval):
 
 
 def _abs_from_choice(value, nearby_indices, base_negate):
-    # Unambiguous components (outside nearby_indices) extend the recorded linear piece
-    # with their fixed recorded sign -- gradient is the constant recorded sign, and
-    # replaying at a different z intentionally does NOT recompute the sign there (see
-    # note below). Ambiguous (near-zero-at-record-time) components instead collapse to
-    # a single zero-gradient choice, matching the hand-coded h_one_norm's "0" hash
-    # (general_nonsmooth_h_funs.py) rather than enumerating all 2**len(nearby_indices)
-    # sign combinations -- that enumeration is exact but intractable once more than a
-    # handful of components tie, and (per that hand-coded implementation's own
-    # comment) the exactness doesn't matter for the convex-hull criticality
-    # calculation manifold sampling actually needs.
     negate = np.array(base_negate)
     ambiguous = np.zeros(len(base_negate), dtype=bool)
     if len(nearby_indices) > 0:
         ambiguous[np.array(nearby_indices, dtype=np.intp)] = True
 
     linear_part = jnp.where(negate, -value, value)
-    # stop_gradient keeps the forward value as the true current abs() (so ambiguous
-    # components are always reported correctly), while forcing their gradient
-    # contribution to exactly 0 -- jnp.where's gradient only flows through the branch
-    # each element selected, so this leaves unambiguous components' ±1 gradient
-    # untouched.
     zero_grad_part = jax.lax.stop_gradient(jnp.abs(value))
     return jnp.where(ambiguous, zero_grad_part, linear_part)
 
@@ -582,16 +536,7 @@ def abs(inval):
         nearby_indices = jnp.where(jnp.abs(inval.value) <= _tolerance.get())[0]
         nearby_indices = tuple(int(x) for x in nearby_indices.tolist())
         logger.debug("abs: recording - nearby_indices=%s", nearby_indices)
-        # Fixed per-index sign at record time: False => extend with "+z_i", True =>
-        # extend with "-z_i". Indices outside nearby_indices are unambiguous, so
-        # replay must keep this raw linear extension rather than recomputing abs at
-        # the (different) replay point's value -- otherwise replaying this branch at
-        # another z silently reverts to the true abs there, instead of extending the
-        # recorded manifold.
         base_negate = tuple(bool(x) for x in (inval.value < 0).tolist())
-        # Exactly one choice regardless of len(nearby_indices) -- see
-        # _abs_from_choice's docstring-comment for why we don't enumerate sign
-        # combinations for ambiguous components.
         choices = [(nearby_indices, base_negate)]
         _trace_append("abs", choices)
         result = HashTensor(_abs_from_choice(inval.value, nearby_indices, base_negate))
@@ -600,8 +545,6 @@ def abs(inval):
     elif _is_vmap_replay.get():
         node, _selector = _trace_popf_vmap("abs")
         nearby_indices, base_negate = node.choices[0]
-        # No selector-driven branch selection needed anymore -- there's only ever one
-        # choice per node now, so every batch element uses the same formula.
         result = HashTensor(_abs_from_choice(inval.value, nearby_indices, base_negate))
         logger.debug("abs: vmap replaying - result=%s", result.value)
         return result
@@ -683,12 +626,6 @@ def replay_grad(fun, path, argnums=0, has_aux=False):
 
 
 def replay_value_and_grad(fun, path, argnums=0, has_aux=False, _jax_vg_fn=None):
-    # _jax_vg_fn lets callers that replay many paths against the same fun (e.g.
-    # all_value_and_grad's per-path loop, h_fun's H0 replay loop) build the
-    # jax.value_and_grad transform once and reuse it, instead of once per path. This
-    # doesn't change tracing/caching behavior -- jax.value_and_grad(fun, ...) itself
-    # does no tracing until called, and each call below still runs eagerly under its
-    # own _branch_mode, so this is exactly equivalent to rebuilding it every call.
     jax_vg_fn = _jax_vg_fn if _jax_vg_fn is not None else jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)
 
     def replayed_val_grad(*args, **kwargs):
@@ -709,9 +646,6 @@ def all_value_and_grad(fun, argnums=0, tol=0.0, has_aux=False):
         defaultresult, paths = record(fun, tol=tol)(*args, **kwargs)
 
         if kwargs or not paths.trace:
-            # Fall back to the original one-path-at-a-time replay loop when there's
-            # nothing to batch over (no tie-break nodes recorded) or for a calling
-            # convention (kwargs) the batched jax.vmap path below doesn't support.
             jax_vg_fn = jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)
             results = []
             for path in paths:
@@ -719,14 +653,6 @@ def all_value_and_grad(fun, argnums=0, tol=0.0, has_aux=False):
                 results.append(vg_fn(*args, **kwargs))
             return defaultresult, results, paths
 
-        # Batch every enumerated path into a SINGLE jax.vmap dispatch instead of one
-        # eager jax.value_and_grad call per path. Each trace node's per-path "choice"
-        # becomes a traced, batched integer array (selector) fed in as an actual
-        # vmapped argument; the tie-break primitives (abs/max/min/maximum/minimum)
-        # read it via _is_vmap_replay/_trace_popf_vmap instead of the plain-Python
-        # ContextVar path used by "replay" mode. _iter_positions reuses PathSet's
-        # existing enumeration order exactly, so path identity (in particular,
-        # index 0 == the "default"/no-flip path) is unchanged from before.
         n_args = len(args)
         n_nodes = len(paths.trace)
         positions = list(paths._iter_positions())

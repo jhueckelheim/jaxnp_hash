@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-Example demonstrating the jaxnp_hash functional API.
-
-User functions are written with standard-looking numpy calls via
-jaxnp_hash.numpy, which transparently intercepts max/min/maximum/
-minimum/abs/sum during record and replay.
-"""
-
 import jax.numpy as jnp
 import jaxnp_hash as jnph
 import jaxnp_hash.numpy as jnp_h
@@ -34,7 +26,6 @@ y = jnp.array([1.05, -1.5, 1.01])
 
 print("=== Functional API Example ===\n")
 
-# 1. record / replay
 print("1. Record and replay:")
 val, paths = jnph.record(branching_function, tol=0.1)(x, y)
 print(f"   Recorded value: {val}")
@@ -46,28 +37,24 @@ for i, p in enumerate(paths):
     print(f"     {paths.format_path(p)}")
 print()
 
-# 2. grad
 print("2. grad (record + differentiate w.r.t. x):")
 g, paths = jnph.grad(simple_function, tol=0.1)(x)
 print(f"   Gradient (default path): {g}")
 print(f"   Number of paths: {len(paths)}")
 print()
 
-# 3. value_and_grad
 print("3. value_and_grad:")
 (val, g), paths = jnph.value_and_grad(simple_function, tol=0.1)(x)
 print(f"   Value: {val}, Gradient: {g}")
 print(f"   Number of paths: {len(paths)}")
 print()
 
-# 4. replay_value_and_grad for each path
 print("4. replay_value_and_grad for each path:")
 for i, p in enumerate(paths):
     v, g = jnph.replay_value_and_grad(simple_function, p)(x)
     print(f"   Path {i+1}: value={v}, grad={g}")
 print()
 
-# 5. has_aux example
 print("5. value_and_grad with has_aux:")
 (val, g, aux), paths = jnph.value_and_grad(aux_function, argnums=0, tol=0.1, has_aux=True)(x, y)
 print(f"   Value: {val}")
@@ -76,13 +63,11 @@ print(f"   Aux: {aux}")
 print(f"   Number of paths: {len(paths)}")
 print()
 
-# 6. replay_grad with has_aux
 print("6. replay_grad with has_aux for each path:")
 for i, p in enumerate(paths):
     g, aux = jnph.replay_grad(aux_function, p, argnums=0, has_aux=True)(x, y)
     print(f"   Path {i+1}: grad={g}, aux={aux}")
 
-# 7. all_value_and_grad
 print("\n7. all_value_and_grad (all paths in one call):")
 results, paths = jnph.all_value_and_grad(simple_function, tol=0.1)(x)
 print(f"   Number of paths: {len(paths)}")
@@ -90,7 +75,6 @@ for i, (v, g) in enumerate(results):
     print(f"   Path {i+1}: value={v}, grad={g}")
 print()
 
-# 8. all_value_and_grad with has_aux
 print("8. all_value_and_grad with has_aux:")
 results, paths = jnph.all_value_and_grad(aux_function, argnums=0, tol=0.1, has_aux=True)(x, y)
 print(f"   Number of paths: {len(paths)}")
