@@ -16,6 +16,8 @@ _tolerance: ContextVar[float] = ContextVar('_tolerance', default=0)
 _is_vmap_replay: ContextVar[bool] = ContextVar('_is_vmap_replay', default=False)
 _vmap_trace: ContextVar[list] = ContextVar('_vmap_trace', default=None)
 _vmap_selectors: ContextVar[tuple] = ContextVar('_vmap_selectors', default=None)
+_is_batch_replay: ContextVar[bool] = ContextVar('_is_batch_replay', default=False)
+_batch_arrays: ContextVar[tuple] = ContextVar('_batch_arrays', default=None)
 
 
 class _TraceNode:
@@ -279,7 +281,7 @@ class PathSet:
 
 
 @contextmanager
-def _branch_mode(mode, tol=0, replay_path=None, trace=None, selectors=None):
+def _branch_mode(mode, tol=0, replay_path=None, trace=None, selectors=None, batch_arrays=None):
     logger.debug("Entering _branch_mode: mode=%s, tolerance=%s", mode, tol)
 
     rec_token = _is_recording.set(False)
@@ -290,6 +292,8 @@ def _branch_mode(mode, tol=0, replay_path=None, trace=None, selectors=None):
     vmap_flag_token = _is_vmap_replay.set(False)
     vmap_trace_token = _vmap_trace.set(None)
     vmap_sel_token = _vmap_selectors.set(None)
+    batch_flag_token = _is_batch_replay.set(False)
+    batch_arrays_token = _batch_arrays.set(None)
 
     try:
         if mode == "record":
@@ -333,6 +337,16 @@ def _branch_mode(mode, tol=0, replay_path=None, trace=None, selectors=None):
             _replay_pos.set(0)
             logger.debug("Starting vmap_replay mode")
             yield
+
+        elif mode == "batch_replay":
+            if batch_arrays is None:
+                raise ValueError("batch_arrays must be provided in batch_replay mode")
+
+            _is_batch_replay.set(True)
+            _batch_arrays.set(tuple(batch_arrays))
+            _replay_pos.set(0)
+            logger.debug("Starting batch_replay mode")
+            yield
         else:
             raise Exception(f"Unexpected branch recording mode {mode}.")
     finally:
@@ -344,6 +358,8 @@ def _branch_mode(mode, tol=0, replay_path=None, trace=None, selectors=None):
         _is_vmap_replay.reset(vmap_flag_token)
         _vmap_trace.reset(vmap_trace_token)
         _vmap_selectors.reset(vmap_sel_token)
+        _is_batch_replay.reset(batch_flag_token)
+        _batch_arrays.reset(batch_arrays_token)
         logger.debug("Exiting _branch_mode")
 
 
@@ -381,6 +397,20 @@ def _trace_popf_vmap(name):
     if node.name != name:
         raise ValueError(f"Expected trace node {name}, got {node.name}")
     return node, selector
+
+
+def _batch_popf(name):
+    arrays = _batch_arrays.get()
+    pos = _replay_pos.get()
+    if arrays is None:
+        raise ValueError("No batch arrays provided for batch_replay mode")
+    if pos >= len(arrays):
+        raise ValueError("Batch arrays exhausted")
+    entry = arrays[pos]
+    _replay_pos.set(pos + 1)
+    if entry[0] != name:
+        raise ValueError(f"Expected trace node {name}, got {entry[0]}")
+    return entry[1:]
 
 
 class HashTensor:
@@ -440,6 +470,10 @@ def max(inval):
         loc = nearby_locs_arr[selector]
         val = inval.value[loc]
         logger.debug("max: vmap replaying - loc=%s, val=%s", loc, val)
+    elif _is_batch_replay.get():
+        (loc,) = _batch_popf("max")
+        val = inval.value[loc]
+        logger.debug("max: batch replaying - loc=%s, val=%s", loc, val)
     else:
         loc = _trace_popf("max")
         val = inval.value[loc]
@@ -462,6 +496,10 @@ def min(inval):
         loc = nearby_locs_arr[selector]
         val = inval.value[loc]
         logger.debug("min: vmap replaying - loc=%s, val=%s", loc, val)
+    elif _is_batch_replay.get():
+        (loc,) = _batch_popf("min")
+        val = inval.value[loc]
+        logger.debug("min: batch replaying - loc=%s, val=%s", loc, val)
     else:
         loc = _trace_popf("min")
         val = inval.value[loc]
@@ -476,6 +514,13 @@ def _elementwise_minmax(one, two, name, jnp_op, prefer_first):
         nearby_indices = tuple(int(x) for x in nearby_indices.tolist())
         logger.debug("%s: recording - nearby_indices=%s", name, nearby_indices)
         base_pick_two = tuple(bool(x) for x in (jnp_op(one.value, two.value) == two.value).tolist())
+        # NOTE: this enumerates 2**len(nearby_indices) choices at record time (unlike
+        # abs(), which was fixed in b527254 to always record exactly one choice). This
+        # is a known, currently-latent risk: a maximum/minimum call over a vector with
+        # many simultaneous ties (e.g. create_censored_L1_loss_hfun_jax) could still
+        # explode combinatorially if ever fed through all_value_and_grad's PathSet
+        # enumeration. replay_value_and_grad_batch below is NOT affected by this, since
+        # it batches over already-resolved paths and never enumerates PathSet choices.
         n_choices = 2 ** len(nearby_indices)
         choices = [(nearby_indices, i, base_pick_two) for i in range(n_choices)]
         _trace_append(name, choices)
@@ -491,17 +536,26 @@ def _elementwise_minmax(one, two, name, jnp_op, prefer_first):
         result = HashTensor(jnp.where(pick_two, two.value, one.value))
         logger.debug("%s: vmap replaying - pick_two=%s, result=%s", name, pick_two, result.value)
         return result
+    elif _is_batch_replay.get():
+        (pick_two,) = _batch_popf(name)
+        result = HashTensor(jnp.where(pick_two, two.value, one.value))
+        logger.debug("%s: batch replaying - pick_two=%s, result=%s", name, pick_two, result.value)
+        return result
     else:
         nearby_indices, choice_int, base_pick_two = _trace_popf(name)
-        pick_two = list(base_pick_two)
-        for j, idx in enumerate(nearby_indices):
-            if (choice_int >> j) & 1:
-                pick_two[idx] = not pick_two[idx]
-        pick_two = np.array(pick_two)
+        pick_two = _resolve_pick_two(nearby_indices, choice_int, base_pick_two)
         result = HashTensor(jnp.where(pick_two, two.value, one.value))
         logger.debug("%s: replaying - pick_two=%s, result=%s", name, pick_two, result.value)
         return result
     return HashTensor(jnp_op(one.value, two.value))
+
+
+def _resolve_pick_two(nearby_indices, choice_int, base_pick_two):
+    pick_two = list(base_pick_two)
+    for j, idx in enumerate(nearby_indices):
+        if (choice_int >> j) & 1:
+            pick_two[idx] = not pick_two[idx]
+    return np.array(pick_two, dtype=bool)
 
 
 def maximum(one, two):
@@ -519,15 +573,19 @@ def sum(inval):
     return result
 
 
+def _abs_from_masks(value, ambiguous, negate):
+    linear_part = jnp.where(negate, -value, value)
+    zero_grad_part = jax.lax.stop_gradient(jnp.abs(value))
+    return jnp.where(ambiguous, zero_grad_part, linear_part)
+
+
 def _abs_from_choice(value, nearby_indices, base_negate):
     negate = np.array(base_negate)
     ambiguous = np.zeros(len(base_negate), dtype=bool)
     if len(nearby_indices) > 0:
         ambiguous[np.array(nearby_indices, dtype=np.intp)] = True
 
-    linear_part = jnp.where(negate, -value, value)
-    zero_grad_part = jax.lax.stop_gradient(jnp.abs(value))
-    return jnp.where(ambiguous, zero_grad_part, linear_part)
+    return _abs_from_masks(value, ambiguous, negate)
 
 
 def abs(inval):
@@ -547,6 +605,11 @@ def abs(inval):
         nearby_indices, base_negate = node.choices[0]
         result = HashTensor(_abs_from_choice(inval.value, nearby_indices, base_negate))
         logger.debug("abs: vmap replaying - result=%s", result.value)
+        return result
+    elif _is_batch_replay.get():
+        ambiguous, negate = _batch_popf("abs")
+        result = HashTensor(_abs_from_masks(inval.value, ambiguous, negate))
+        logger.debug("abs: batch replaying - result=%s", result.value)
         return result
     else:
         nearby_indices, base_negate = _trace_popf("abs")
@@ -641,6 +704,102 @@ def replay_value_and_grad(fun, path, argnums=0, has_aux=False, _jax_vg_fn=None):
     return replayed_val_grad
 
 
+def _build_batch_leaves(paths, names):
+    """Convert J already-resolved paths' choices into dense, vmap-able arrays.
+
+    Unlike all_value_and_grad's selector arrays (which index into a PathSet's
+    Cartesian-product enumeration), this only ever reads path[i].choices[0] for each
+    of the J given paths -- there is no enumeration here, so this cannot blow up
+    combinatorially regardless of how many ties a record-time trace had.
+    """
+    J = len(paths)
+    flat_leaves = []
+    leaf_layout = []
+    for i, name in enumerate(names):
+        choices = [path[i].choices[0] for path in paths]
+        if name in ("max", "min"):
+            loc_arr = jnp.asarray(choices, dtype=jnp.int32)
+            flat_leaves.append(loc_arr)
+            leaf_layout.append((name, 1))
+        elif name == "abs":
+            p = len(choices[0][1])
+            negate = np.zeros((J, p), dtype=bool)
+            ambiguous = np.zeros((J, p), dtype=bool)
+            for k, (nearby_indices, base_negate) in enumerate(choices):
+                negate[k] = np.asarray(base_negate, dtype=bool)
+                if len(nearby_indices) > 0:
+                    ambiguous[k, np.array(nearby_indices, dtype=np.intp)] = True
+            flat_leaves.append(jnp.asarray(ambiguous))
+            flat_leaves.append(jnp.asarray(negate))
+            leaf_layout.append((name, 2))
+        elif name in ("maximum", "minimum"):
+            pick_two = np.stack([_resolve_pick_two(*c) for c in choices])
+            flat_leaves.append(jnp.asarray(pick_two))
+            leaf_layout.append((name, 1))
+        else:
+            raise ValueError(f"replay_value_and_grad_batch: unsupported traced op {name!r}")
+    return flat_leaves, leaf_layout
+
+
+def replay_value_and_grad_batch(fun, paths, argnums=0, has_aux=False):
+    """Batch replay+grad of `fun` over J independently-obtained, fully-resolved paths.
+
+    This is the batching mechanism for h_fun's H0-given branch: H0 is a Python list of
+    length J of already-resolved paths (e.g. accumulated by choose_generator_set from
+    several distinct nearby points), not a PathSet to enumerate. It vmaps a single
+    jax.value_and_grad(fun) call over all J paths at once, instead of dispatching J
+    separate unbatched jax calls (~11.5ms of dispatch overhead each). Because it only
+    ever reads each path's already-narrowed choices[0] and never constructs a PathSet
+    or calls _iter_positions, its cost is O(J) by construction -- it cannot reintroduce
+    the combinatorial explosion that vmapping over a PathSet's full enumeration caused
+    for the one-norm (abs-heavy) hfun.
+    """
+    paths = list(paths)
+    J = len(paths)
+
+    def batched_val_grad(*args, **kwargs):
+        if kwargs:
+            raise TypeError("replay_value_and_grad_batch does not support kwargs")
+        n_args = len(args)
+
+        if J == 0:
+            raise ValueError("replay_value_and_grad_batch requires at least one path")
+
+        names = [node.name for node in paths[0]]
+        for path in paths[1:]:
+            if [node.name for node in path] != names:
+                raise ValueError(
+                    "replay_value_and_grad_batch requires all paths to share the same "
+                    "op-name sequence (same traced control flow)."
+                )
+
+        flat_leaves, leaf_layout = _build_batch_leaves(paths, names)
+
+        def vmap_body(*inner_args):
+            call_args = inner_args[:n_args]
+            flat_node_leaves = inner_args[n_args:]
+            batch_arrays = []
+            idx = 0
+            for name, n_leaves in leaf_layout:
+                batch_arrays.append((name, *flat_node_leaves[idx:idx + n_leaves]))
+                idx += n_leaves
+            with _branch_mode("batch_replay", batch_arrays=batch_arrays):
+                return fun(*call_args)
+
+        jax_vg_fn = jax.value_and_grad(vmap_body, argnums=argnums, has_aux=has_aux)
+        in_axes = (None,) * n_args + (0,) * len(flat_leaves)
+        vmap_vg_fn = jax.vmap(jax_vg_fn, in_axes=in_axes)
+        vg_out = vmap_vg_fn(*args, *flat_leaves)
+
+        if has_aux:
+            (values, aux), grads = vg_out
+            return values, grads, aux
+        else:
+            values, grads = vg_out
+            return values, grads
+    return batched_val_grad
+
+
 def all_value_and_grad(fun, argnums=0, tol=0.0, has_aux=False):
     def all_vg_fn(*args, **kwargs):
         defaultresult, paths = record(fun, tol=tol)(*args, **kwargs)
@@ -701,14 +860,12 @@ def h_fun(fun, argnums=0, tol=0.0, has_aux=False):
             return defaultresult, grads, paths
         else:
             J = len(H0)
-            h = np.zeros(J, dtype=float)
-            grads = np.zeros((z_jax.shape[0], J), dtype=float)
-            jax_vg_fn = jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)
+            if J == 0:
+                return np.zeros(0, dtype=float), np.zeros((z_jax.shape[0], 0), dtype=float)
 
-            for k, path in enumerate(H0):
-                v, g = replay_value_and_grad(fun, path, argnums=argnums, has_aux=has_aux, _jax_vg_fn=jax_vg_fn)(z_jax)
-                h[k] = float(v)
-                grads[:, k] = np.asarray(g)
+            v, g = replay_value_and_grad_batch(fun, H0, argnums=argnums, has_aux=has_aux)(z_jax)
+            h = np.asarray(v, dtype=float)
+            grads = np.asarray(g, dtype=float).T
 
             return h, grads
 
