@@ -1,3 +1,4 @@
+import importlib
 import time
 from itertools import product
 
@@ -8,6 +9,11 @@ import pytest
 
 import jaxnp_hash as jnph
 import jaxnp_hash.numpy as jnph_np
+
+# jaxnp_hash/__init__.py does `from .HashTensor import HashTensor` (the class), which
+# shadows the `jaxnp_hash.HashTensor` submodule attribute on the package -- import via
+# importlib to reach private module-level helpers like `_bucket_size`.
+ht = importlib.import_module("jaxnp_hash.HashTensor")
 
 
 def test_maximum():
@@ -710,6 +716,34 @@ def test_replay_value_and_grad_batch_large_J_no_blowup():
     assert dt < 5.0, f"batched replay over J={n} took {dt:.2f}s, expected well under a second"
     assert values.shape == (n,)
     assert grads.shape == (n, n)
+
+
+def test_bucket_size():
+    expected = {1: 1, 2: 2, 3: 4, 4: 4, 5: 8, 8: 8, 9: 16, 44: 64, 87: 128}
+    for J, want in expected.items():
+        assert ht._bucket_size(J) == want
+
+
+def test_replay_value_and_grad_batch_padding_matches_unpadded():
+    # J values that are NOT powers of two, so _bucket_size's padding is exercised.
+    def f(x):
+        return jnph_np.max(x)
+
+    n = 10
+    z = jnp.arange(n, dtype=jnp.float32)
+
+    for J in (3, 5, 6, 7):
+        xs = [jnp.asarray(np.random.RandomState(i).rand(n)) for i in range(J)]
+        paths = [list(jnph.record(f, tol=0.0)(x)[1])[0] for x in xs]
+
+        values, grads = jnph.replay_value_and_grad_batch(f, paths)(z)
+        assert values.shape == (J,)
+        assert grads.shape == (J, n)
+
+        for k, path in enumerate(paths):
+            manual_v, manual_g = jnph.replay_value_and_grad(f, path)(z)
+            assert jnp.allclose(values[k], manual_v)
+            assert jnp.allclose(grads[k], manual_g)
 
 
 def test_replay_value_and_grad_batch_mismatched_paths_raises():

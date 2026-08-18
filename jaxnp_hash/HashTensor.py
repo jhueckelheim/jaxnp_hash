@@ -747,6 +747,15 @@ def _build_batch_leaves(paths, names):
     return flat_leaves, leaf_layout
 
 
+def _bucket_size(J):
+    """Round J up to the next power of two so the jitted vmap_body only ever sees
+    O(log2(J_max)) distinct batch shapes across a run, instead of a fresh XLA compile
+    for every J value encountered (J varies a lot call-to-call in practice)."""
+    if J <= 1:
+        return 1
+    return 1 << (J - 1).bit_length()
+
+
 def _get_jit_batched_vg(fun, leaf_layout, n_args, argnums, has_aux):
     """Return a cached jax.jit-compiled (vmap . value_and_grad) callable for the given
     (fun, op-sequence) shape, building and caching it on first use.
@@ -834,8 +843,25 @@ def replay_value_and_grad_batch(fun, paths, argnums=0, has_aux=False):
 
         flat_leaves, leaf_layout = _build_batch_leaves(paths, names)
 
+        # Pad the batch axis up to a power-of-two bucket so the jitted vmap_body only
+        # recompiles for a new bucket size, not for every distinct J -- see
+        # _bucket_size. Safe because vmap's batching is embarrassingly parallel (no
+        # reduction across the batch axis inside vmap_body/fun), so repeating the last
+        # path's leaf data into the padding lanes cannot affect the real lanes' values
+        # or grads; slicing back to [:J] below reproduces an unpadded call exactly.
+        padded_J = _bucket_size(J)
+        if padded_J != J:
+            pad_amount = padded_J - J
+            flat_leaves = [
+                jnp.pad(leaf, [(0, pad_amount)] + [(0, 0)] * (leaf.ndim - 1), mode="edge")
+                for leaf in flat_leaves
+            ]
+
         vmap_vg_fn = _get_jit_batched_vg(fun, leaf_layout, n_args, argnums, has_aux)
         vg_out = vmap_vg_fn(*args, *flat_leaves)
+
+        if padded_J != J:
+            vg_out = jax.tree_util.tree_map(lambda a: a[:J], vg_out)
 
         if has_aux:
             (values, aux), grads = vg_out
@@ -848,7 +874,7 @@ def replay_value_and_grad_batch(fun, paths, argnums=0, has_aux=False):
 
 def all_value_and_grad(fun, argnums=0, tol=0.0, has_aux=False):
     def all_vg_fn(*args, **kwargs):
-        defaultresult, paths = record(fun, tol=tol)(*args, **kwargs)
+        _defaultresult, paths = record(fun, tol=tol)(*args, **kwargs)
 
         if kwargs or not paths.trace:
             jax_vg_fn = jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)
@@ -856,7 +882,7 @@ def all_value_and_grad(fun, argnums=0, tol=0.0, has_aux=False):
             for path in paths:
                 vg_fn = replay_value_and_grad(fun, path, argnums=argnums, has_aux=has_aux, _jax_vg_fn=jax_vg_fn)
                 results.append(vg_fn(*args, **kwargs))
-            return defaultresult, results, paths
+            return results, paths
 
         n_args = len(args)
         n_nodes = len(paths.trace)
@@ -885,7 +911,7 @@ def all_value_and_grad(fun, argnums=0, tol=0.0, has_aux=False):
             for k in range(n_paths):
                 results.append((values[k], grads[k]))
 
-        return defaultresult, results, paths
+        return results, paths
     return all_vg_fn
 
 
