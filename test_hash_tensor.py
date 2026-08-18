@@ -757,6 +757,54 @@ def test_h_fun_batch_replay_matches_loop():
     assert g0.shape == (z.shape[0], 0)
 
 
+def test_h_fun_record_branch_matches_manual():
+    def f(x):
+        return jnph_np.max(x)
+
+    hfun = jnph.h_fun(f, tol=0.1)
+    z = np.array([1.0, 1.05, 0.5])
+
+    defaultresult, grads, paths = hfun(z)
+    full_paths = list(paths)
+    assert len(full_paths) == 2
+    assert grads.shape == (z.shape[0], 2)
+
+    for k, path in enumerate(full_paths):
+        manual_v, manual_g = jnph.replay_value_and_grad(f, path)(jnp.asarray(z))
+        assert np.allclose(grads[:, k], np.asarray(manual_g))
+
+
+def test_h_fun_record_branch_cache_correctness_across_different_ties():
+    # Regression guard: the record (H0=None) branch now routes through the same
+    # jit-cached replay_value_and_grad_batch machinery as the H0-given branch. That
+    # cache is keyed on (fun, leaf_layout, n_args, argnums, has_aux) -- NOT on J or
+    # the concrete tie locations -- so calls with different npaths/choices but the
+    # same op-sequence must each get correct, non-stale results.
+    def f(x):
+        return jnph_np.max(x)
+
+    hfun = jnph.h_fun(f, tol=0.0)
+
+    z1 = np.array([1.0, 1.0, 1.0, 0.0])  # 3-way tie -> npaths=3
+    _, grads1, paths1 = hfun(z1)
+    full_paths1 = list(paths1)
+    assert len(full_paths1) == 3
+    for k, path in enumerate(full_paths1):
+        manual_v, manual_g = jnph.replay_value_and_grad(f, path)(jnp.asarray(z1))
+        assert np.allclose(grads1[:, k], np.asarray(manual_g))
+
+    z2 = np.array([5.0, 0.0, 0.0, 0.0])  # unique max -> npaths=1
+    _, grads2, paths2 = hfun(z2)
+    full_paths2 = list(paths2)
+    assert len(full_paths2) == 1
+    manual_v2, manual_g2 = jnph.replay_value_and_grad(f, full_paths2[0])(jnp.asarray(z2))
+    assert np.allclose(grads2[:, 0], np.asarray(manual_g2))
+
+    # Re-run z1 to confirm the J=1 call above didn't corrupt the (same-cache-key) J=3 case.
+    _, grads1b, _ = hfun(z1)
+    assert np.allclose(grads1b, grads1)
+
+
 def test_passthrough_outside_mode():
     x = jnp.array([1.0, 2.0, 3.0])
     y = jnp.array([1.5, 1.5, 1.5])

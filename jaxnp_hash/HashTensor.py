@@ -19,6 +19,12 @@ _vmap_selectors: ContextVar[tuple] = ContextVar('_vmap_selectors', default=None)
 _is_batch_replay: ContextVar[bool] = ContextVar('_is_batch_replay', default=False)
 _batch_arrays: ContextVar[tuple] = ContextVar('_batch_arrays', default=None)
 
+# Cache of jax.jit-compiled (vmap . value_and_grad) callables for
+# replay_value_and_grad_batch, keyed by (fun, op-sequence, ...) -- see
+# _get_jit_batched_vg below. Keyed on `fun` itself (not id(fun)) so the cache entry
+# holds a strong reference, ruling out id-reuse after GC.
+_jit_batch_cache: dict = {}
+
 
 class _TraceNode:
     def __init__(self, name, choices):
@@ -741,6 +747,55 @@ def _build_batch_leaves(paths, names):
     return flat_leaves, leaf_layout
 
 
+def _get_jit_batched_vg(fun, leaf_layout, n_args, argnums, has_aux):
+    """Return a cached jax.jit-compiled (vmap . value_and_grad) callable for the given
+    (fun, op-sequence) shape, building and caching it on first use.
+
+    `leaf_layout` is a pure function of the traced op-name sequence (not of J or the
+    concrete choice values), so it's a safe, stable cache key: every call whose fun and
+    control-flow shape match reuses the same jitted wrapper. JAX's own shape-based
+    dispatch then recompiles only when it sees a new J (batch size) and otherwise reuses
+    the compiled program -- exactly what we want once J plateaus near convergence.
+
+    This must be constructed once and reused, not rebuilt+jitted per call: jax.jit on a
+    freshly-built function object every call gets zero cache reuse (jit's cache is keyed
+    to the wrapped function's identity), so it would only add compilation overhead on
+    top of the existing eager cost.
+
+    Safe to cache because the per-path choice data always flows in as traced vmap
+    arguments (`inner_args`/`flat_node_leaves` below), never as closed-over Python
+    constants -- so reusing the compiled program across calls with different H0 entries
+    cannot go stale.
+    """
+    key = (fun, tuple(leaf_layout), n_args, argnums, has_aux)
+    cached = _jit_batch_cache.get(key)
+    if cached is not None:
+        return cached
+
+    def vmap_body(*inner_args):
+        call_args = inner_args[:n_args]
+        flat_node_leaves = inner_args[n_args:]
+        batch_arrays = []
+        idx = 0
+        for name, n_leaves in leaf_layout:
+            batch_arrays.append((name, *flat_node_leaves[idx:idx + n_leaves]))
+            idx += n_leaves
+        with _branch_mode("batch_replay", batch_arrays=batch_arrays):
+            return fun(*call_args)
+
+    jax_vg_fn = jax.value_and_grad(vmap_body, argnums=argnums, has_aux=has_aux)
+    # NB: this module defines its own `sum` (for HashTensor values, see below), which
+    # shadows the builtin -- use a plain loop instead of sum(...) here.
+    total_leaves = 0
+    for _, n_leaves in leaf_layout:
+        total_leaves += n_leaves
+    in_axes = (None,) * n_args + (0,) * total_leaves
+    vmap_vg_fn = jax.vmap(jax_vg_fn, in_axes=in_axes)
+    jitted = jax.jit(vmap_vg_fn)
+    _jit_batch_cache[key] = jitted
+    return jitted
+
+
 def replay_value_and_grad_batch(fun, paths, argnums=0, has_aux=False):
     """Batch replay+grad of `fun` over J independently-obtained, fully-resolved paths.
 
@@ -753,6 +808,10 @@ def replay_value_and_grad_batch(fun, paths, argnums=0, has_aux=False):
     or calls _iter_positions, its cost is O(J) by construction -- it cannot reintroduce
     the combinatorial explosion that vmapping over a PathSet's full enumeration caused
     for the one-norm (abs-heavy) hfun.
+
+    The vmap(value_and_grad(...)) callable itself is jit-compiled and cached across
+    calls (see _get_jit_batched_vg) -- without that, every call pays full un-jitted JAX
+    dispatch overhead for every op regardless of batching.
     """
     paths = list(paths)
     J = len(paths)
@@ -775,20 +834,7 @@ def replay_value_and_grad_batch(fun, paths, argnums=0, has_aux=False):
 
         flat_leaves, leaf_layout = _build_batch_leaves(paths, names)
 
-        def vmap_body(*inner_args):
-            call_args = inner_args[:n_args]
-            flat_node_leaves = inner_args[n_args:]
-            batch_arrays = []
-            idx = 0
-            for name, n_leaves in leaf_layout:
-                batch_arrays.append((name, *flat_node_leaves[idx:idx + n_leaves]))
-                idx += n_leaves
-            with _branch_mode("batch_replay", batch_arrays=batch_arrays):
-                return fun(*call_args)
-
-        jax_vg_fn = jax.value_and_grad(vmap_body, argnums=argnums, has_aux=has_aux)
-        in_axes = (None,) * n_args + (0,) * len(flat_leaves)
-        vmap_vg_fn = jax.vmap(jax_vg_fn, in_axes=in_axes)
+        vmap_vg_fn = _get_jit_batched_vg(fun, leaf_layout, n_args, argnums, has_aux)
         vg_out = vmap_vg_fn(*args, *flat_leaves)
 
         if has_aux:
@@ -849,13 +895,24 @@ def h_fun(fun, argnums=0, tol=0.0, has_aux=False):
         z_jax = jnp.asarray(z)
 
         if H0 is None:
-            defaultresult, results, paths = all_value_and_grad(fun, argnums=argnums, tol=tol, has_aux=has_aux)(z_jax)
+            defaultresult, paths = record(fun, tol=tol)(z_jax)
 
-            grads = np.zeros((z_jax.shape[0], len(paths)), dtype=float)
-            h_vals = np.zeros(len(paths), dtype=float)
-            for k, (v, g) in enumerate(results):
-                h_vals[k] = float(v)
-                grads[:, k] = np.asarray(g)
+            if not paths.trace:
+                # No traced max/min/abs/maximum/minimum ops at all -- a single default
+                # path, nothing to batch (jax.vmap needs at least one non-None in_axes
+                # entry, so this can't go through replay_value_and_grad_batch below).
+                jax_vg_fn = jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)
+                vg_result = jax_vg_fn(z_jax)
+                if has_aux:
+                    (v, _aux), g = vg_result
+                else:
+                    v, g = vg_result
+                grads = np.asarray(g, dtype=float).reshape(z_jax.shape[0], 1)
+                return defaultresult, grads, paths
+
+            full_paths = list(paths)
+            v, g = replay_value_and_grad_batch(fun, full_paths, argnums=argnums, has_aux=has_aux)(z_jax)
+            grads = np.asarray(g, dtype=float).T
 
             return defaultresult, grads, paths
         else:
