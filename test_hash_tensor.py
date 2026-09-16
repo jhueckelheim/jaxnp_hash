@@ -1,9 +1,19 @@
+import importlib
+import time
 from itertools import product
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
+
 import jaxnp_hash as jnph
 import jaxnp_hash.numpy as jnph_np
+
+# jaxnp_hash/__init__.py does `from .HashTensor import HashTensor` (the class), which
+# shadows the `jaxnp_hash.HashTensor` submodule attribute on the package -- import via
+# importlib to reach private module-level helpers like `_bucket_size`.
+ht = importlib.import_module("jaxnp_hash.HashTensor")
 
 
 def test_maximum():
@@ -124,33 +134,50 @@ def test_abs():
     val, paths = jnph.record(f, tol=0.1)(x2)
     assert val[0] == 0.05
     assert jnp.allclose(val[1:], jnp.array([2.0, 2.5]))
-    assert len(paths) == 2
+    assert len(paths) == 1
 
-    expected_results = set()
-    for first_val in [0.05, -0.05]:
-        expected_results.add(tuple(jnp.array([first_val, 2.0, 2.5]).tolist()))
-
-    actual_results = set()
-    for p in paths:
-        result = jnph.replay(f, p)(x2)
-        actual_results.add(tuple(result.tolist()))
-
-    assert actual_results == expected_results
+    replayed = jnph.replay(f, paths[0])(x2)
+    assert jnp.allclose(replayed, jnp.array([0.05, 2.0, 2.5]))
 
     x3 = jnp.array([0.05, -0.05, 0.03])
     val, paths = jnph.record(f, tol=0.1)(x3)
-    assert len(paths) == 8
+    assert len(paths) == 1
+    assert jnp.allclose(val, jnp.array([0.05, 0.05, 0.03]))
 
-    expected_results = set()
-    for vals in product([0.05, -0.05], [0.05, -0.05], [0.03, -0.03]):
-        expected_results.add(tuple(jnp.array(vals).tolist()))
+    replayed = jnph.replay(f, paths[0])(x3)
+    assert jnp.allclose(replayed, jnp.array([0.05, 0.05, 0.03]))
 
-    actual_results = set()
-    for p in paths:
-        result = jnph.replay(f, p)(x3)
-        actual_results.add(tuple(result.tolist()))
 
-    assert actual_results == expected_results
+def test_abs_ambiguous_gradient_is_zero():
+    def f(x):
+        return jnph_np.sum(jnph_np.abs(x))
+
+    x = jnp.array([0.05, -2.0, 2.5])
+    g, paths = jnph.grad(f, tol=0.1)(x)
+    assert len(paths) == 1
+    assert jnp.allclose(g, jnp.array([0.0, -1.0, 1.0]))
+
+
+def test_abs_replay_at_different_point():
+    def f(x):
+        return jnph_np.abs(x)
+
+    x = jnp.array([0.05, -2.0, 2.5])
+    _, paths = jnph.record(f, tol=0.1)(x)
+    path = paths[0]
+
+    x_prime = jnp.array([0.03, 2.0, 2.5])
+    replayed = jnph.replay(f, path)(x_prime)
+    assert jnp.allclose(replayed, jnp.array([0.03, -2.0, 2.5]))
+
+    def f_sum(x):
+        return jnph_np.sum(jnph_np.abs(x))
+
+    _, sum_paths = jnph.record(f_sum, tol=0.1)(x)
+    sum_path = sum_paths[0]
+    v, g = jnph.replay_value_and_grad(f_sum, sum_path)(x_prime)
+    assert jnp.allclose(v, 0.03 - 2.0 + 2.5)
+    assert jnp.allclose(g, jnp.array([0.0, -1.0, 1.0]))
 
 
 def test_path_set_operations():
@@ -607,6 +634,211 @@ def test_all_value_and_grad_argnums():
     assert jnp.allclose(g_y, jnp.array([1.0, 0.0, 0.0]))
 
 
+def test_replay_value_and_grad_batch_matches_loop_max_min():
+    def f_max(x):
+        return jnph_np.max(x)
+
+    def f_min(x):
+        return jnph_np.min(x)
+
+    z = jnp.array([2.0, 4.0, 6.0])
+
+    for f in (f_max, f_min):
+        xs = [
+            jnp.array([1.0, 3.0, 2.0]),
+            jnp.array([5.0, 1.0, 5.0]),
+            jnp.array([0.0, -1.0, 2.0]),
+        ]
+        paths = [list(jnph.record(f, tol=0.0)(x)[1])[0] for x in xs]
+
+        values, grads = jnph.replay_value_and_grad_batch(f, paths)(z)
+        for k, path in enumerate(paths):
+            manual_v, manual_g = jnph.replay_value_and_grad(f, path)(z)
+            assert jnp.allclose(values[k], manual_v)
+            assert jnp.allclose(grads[k], manual_g)
+
+
+def test_replay_value_and_grad_batch_matches_loop_abs():
+    def f(x):
+        return jnph_np.sum(jnph_np.abs(x))
+
+    xs = [
+        jnp.array([1.0, -0.5, 0.005, 2.0, -0.005]),
+        jnp.array([-3.0, 0.5, 0.5, -0.001, 4.0]),
+        jnp.array([2.0, 2.0, 2.0, 2.0, 2.0]),
+    ]
+    paths = [list(jnph.record(f, tol=0.01)(x)[1])[0] for x in xs]
+    z = jnp.array([1.0, -2.0, 0.5, 3.0, -0.2])
+
+    values, grads = jnph.replay_value_and_grad_batch(f, paths)(z)
+    for k, path in enumerate(paths):
+        manual_v, manual_g = jnph.replay_value_and_grad(f, path)(z)
+        assert jnp.allclose(values[k], manual_v)
+        assert jnp.allclose(grads[k], manual_g)
+
+
+def test_replay_value_and_grad_batch_matches_loop_maximum_minimum():
+    def f(x, y):
+        return jnph_np.sum(jnph_np.maximum(x, y))
+
+    x = jnp.array([1.0, 2.0, 3.0])
+    y = jnp.array([1.05, 1.95, 3.05])
+    _, path_set = jnph.record(f, tol=0.1)(x, y)
+    paths = list(path_set)
+    assert len(paths) > 1
+
+    z1 = jnp.array([2.0, -1.0, 0.5])
+    z2 = jnp.array([1.9, -1.5, 0.6])
+
+    values, grads = jnph.replay_value_and_grad_batch(f, paths, argnums=(0, 1))(z1, z2)
+    for k, path in enumerate(paths):
+        manual_v, manual_g = jnph.replay_value_and_grad(f, path, argnums=(0, 1))(z1, z2)
+        assert jnp.allclose(values[k], manual_v)
+        assert jnp.allclose(grads[0][k], manual_g[0])
+        assert jnp.allclose(grads[1][k], manual_g[1])
+
+
+def test_replay_value_and_grad_batch_large_J_no_blowup():
+    def f(x):
+        return jnph_np.max(x)
+
+    n = 44
+    x = jnp.ones(n) * 5.0
+    _, path_set = jnph.record(f, tol=0.0)(x)
+    paths = list(path_set)
+    assert len(paths) == n
+
+    z = jnp.arange(n, dtype=jnp.float32)
+    t0 = time.time()
+    values, grads = jnph.replay_value_and_grad_batch(f, paths)(z)
+    dt = time.time() - t0
+
+    assert dt < 5.0, f"batched replay over J={n} took {dt:.2f}s, expected well under a second"
+    assert values.shape == (n,)
+    assert grads.shape == (n, n)
+
+
+def test_bucket_size():
+    expected = {1: 1, 2: 2, 3: 4, 4: 4, 5: 8, 8: 8, 9: 16, 44: 64, 87: 128}
+    for J, want in expected.items():
+        assert ht._bucket_size(J) == want
+
+
+def test_replay_value_and_grad_batch_padding_matches_unpadded():
+    # J values that are NOT powers of two, so _bucket_size's padding is exercised.
+    def f(x):
+        return jnph_np.max(x)
+
+    n = 10
+    z = jnp.arange(n, dtype=jnp.float32)
+
+    for J in (3, 5, 6, 7):
+        xs = [jnp.asarray(np.random.RandomState(i).rand(n)) for i in range(J)]
+        paths = [list(jnph.record(f, tol=0.0)(x)[1])[0] for x in xs]
+
+        values, grads = jnph.replay_value_and_grad_batch(f, paths)(z)
+        assert values.shape == (J,)
+        assert grads.shape == (J, n)
+
+        for k, path in enumerate(paths):
+            manual_v, manual_g = jnph.replay_value_and_grad(f, path)(z)
+            assert jnp.allclose(values[k], manual_v)
+            assert jnp.allclose(grads[k], manual_g)
+
+
+def test_replay_value_and_grad_batch_mismatched_paths_raises():
+    def f_max(x):
+        return jnph_np.max(x)
+
+    def f_maximum(y, z):
+        return jnph_np.sum(jnph_np.maximum(y, z))
+
+    x = jnp.array([1.0, 3.0, 2.0])
+    _, max_paths = jnph.record(f_max, tol=0.0)(x)
+    max_path = list(max_paths)[0]
+
+    y = jnp.array([1.0, 3.0])
+    z = jnp.array([1.0, 3.0])
+    _, maximum_paths = jnph.record(f_maximum, tol=0.5)(y, z)
+    maximum_path = list(maximum_paths)[0]
+
+    with pytest.raises(ValueError):
+        jnph.replay_value_and_grad_batch(f_max, [max_path, maximum_path])(x)
+
+
+def test_h_fun_batch_replay_matches_loop():
+    def f(x):
+        return jnph_np.sum(jnph_np.abs(x)) + jnph_np.max(x)
+
+    hfun = jnph.h_fun(f, tol=0.01)
+    z = np.array([1.0, -0.5, 0.005, 2.0, -0.005])
+
+    defaultresult, grads0, paths = hfun(z)
+    H0 = list(paths)
+    assert len(H0) >= 1
+
+    h, grads = hfun(z, H0=H0)
+    assert h.shape == (len(H0),)
+    assert grads.shape == (z.shape[0], len(H0))
+
+    for k, path in enumerate(H0):
+        manual_v, manual_g = jnph.replay_value_and_grad(f, path)(jnp.asarray(z))
+        assert np.allclose(h[k], float(manual_v))
+        assert np.allclose(grads[:, k], np.asarray(manual_g))
+
+    h0, g0 = hfun(z, H0=[])
+    assert h0.shape == (0,)
+    assert g0.shape == (z.shape[0], 0)
+
+
+def test_h_fun_record_branch_matches_manual():
+    def f(x):
+        return jnph_np.max(x)
+
+    hfun = jnph.h_fun(f, tol=0.1)
+    z = np.array([1.0, 1.05, 0.5])
+
+    defaultresult, grads, paths = hfun(z)
+    full_paths = list(paths)
+    assert len(full_paths) == 2
+    assert grads.shape == (z.shape[0], 2)
+
+    for k, path in enumerate(full_paths):
+        manual_v, manual_g = jnph.replay_value_and_grad(f, path)(jnp.asarray(z))
+        assert np.allclose(grads[:, k], np.asarray(manual_g))
+
+
+def test_h_fun_record_branch_cache_correctness_across_different_ties():
+    # Regression guard: the record (H0=None) branch now routes through the same
+    # jit-cached replay_value_and_grad_batch machinery as the H0-given branch. That
+    # cache is keyed on (fun, leaf_layout, n_args, argnums, has_aux) -- NOT on J or
+    # the concrete tie locations -- so calls with different npaths/choices but the
+    # same op-sequence must each get correct, non-stale results.
+    def f(x):
+        return jnph_np.max(x)
+
+    hfun = jnph.h_fun(f, tol=0.0)
+
+    z1 = np.array([1.0, 1.0, 1.0, 0.0])  # 3-way tie -> npaths=3
+    _, grads1, paths1 = hfun(z1)
+    full_paths1 = list(paths1)
+    assert len(full_paths1) == 3
+    for k, path in enumerate(full_paths1):
+        manual_v, manual_g = jnph.replay_value_and_grad(f, path)(jnp.asarray(z1))
+        assert np.allclose(grads1[:, k], np.asarray(manual_g))
+
+    z2 = np.array([5.0, 0.0, 0.0, 0.0])  # unique max -> npaths=1
+    _, grads2, paths2 = hfun(z2)
+    full_paths2 = list(paths2)
+    assert len(full_paths2) == 1
+    manual_v2, manual_g2 = jnph.replay_value_and_grad(f, full_paths2[0])(jnp.asarray(z2))
+    assert np.allclose(grads2[:, 0], np.asarray(manual_g2))
+
+    # Re-run z1 to confirm the J=1 call above didn't corrupt the (same-cache-key) J=3 case.
+    _, grads1b, _ = hfun(z1)
+    assert np.allclose(grads1b, grads1)
+
+
 def test_passthrough_outside_mode():
     x = jnp.array([1.0, 2.0, 3.0])
     y = jnp.array([1.5, 1.5, 1.5])
@@ -663,6 +895,12 @@ if __name__ == "__main__":
     test_all_value_and_grad_matches_manual()
     test_all_value_and_grad_has_aux()
     test_all_value_and_grad_argnums()
+    test_replay_value_and_grad_batch_matches_loop_max_min()
+    test_replay_value_and_grad_batch_matches_loop_abs()
+    test_replay_value_and_grad_batch_matches_loop_maximum_minimum()
+    test_replay_value_and_grad_batch_large_J_no_blowup()
+    test_replay_value_and_grad_batch_mismatched_paths_raises()
+    test_h_fun_batch_replay_matches_loop()
     test_passthrough_outside_mode()
     test_numpy_non_overridden_functions()
     print("All tests passed!")
