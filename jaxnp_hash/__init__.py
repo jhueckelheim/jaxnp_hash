@@ -10,4 +10,9 @@ from .HashTensor import (
     replay_value_and_grad_batch,
     all_value_and_grad,
     h_fun,
+    path_key,
+    paths_equal,
+    unique_paths,
+    paths_any_in,
+    paths_all_in,
 )
