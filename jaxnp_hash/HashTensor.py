@@ -60,6 +60,68 @@ class _TraceNode:
             return True
 
 
+def path_key(path):
+    """Canonical hashable key for a single resolved path.
+
+    A "path" is a list of `_TraceNode`, each already narrowed to exactly one
+    choice -- e.g. an element yielded by iterating a `PathSet`, or `PathSet[i]`.
+    `_TraceNode` defines `__eq__` but not `__hash__`, so a bare `_TraceNode`
+    (and any list containing one) is unhashable in plain Python: `set()`/`dict`
+    keyed on paths, or a `path in some_list` check, silently falls back to an
+    O(n) linear scan (or raises `TypeError` if you try to hash it directly).
+    `path_key` gives callers a plain tuple of hashable primitives (the trace
+    node names and their resolved choices, which `_branch_mode` always builds
+    out of ints/bools/tuples) so raw paths can be deduplicated or tested for
+    membership in O(1) amortized per path instead of O(n).
+    """
+    return tuple((node.name, node.choices[0]) for node in path)
+
+
+def paths_equal(path1, path2):
+    """Value equality for two individual paths, independent of identity/hashing."""
+    if len(path1) != len(path2):
+        return False
+    for node1, node2 in zip(path1, path2):
+        if node1.name != node2.name:
+            return False
+        if len(node1.choices) != 1 or len(node2.choices) != 1:
+            return False
+        if node1.choices[0] != node2.choices[0]:
+            return False
+    return True
+
+
+def unique_paths(paths):
+    """Deduplicate an arbitrary iterable of individual paths, in O(n).
+
+    Keeps the first occurrence of each distinct path (by value, per
+    `paths_equal`) and drops later duplicates. Because paths are unhashable,
+    doing this by hand (`if p not in seen_list: seen_list.append(p)`) costs
+    O(n^2) equality comparisons; `unique_paths` costs O(n) by hashing each
+    path's `path_key` instead.
+    """
+    seen = set()
+    out = []
+    for p in paths:
+        key = path_key(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def paths_any_in(needles, haystack):
+    """True if any path in `needles` also appears (by value) in `haystack`."""
+    haystack_keys = {path_key(p) for p in haystack}
+    return any(path_key(p) in haystack_keys for p in needles)
+
+
+def paths_all_in(needles, haystack):
+    """True if every path in `needles` also appears (by value) in `haystack`."""
+    haystack_keys = {path_key(p) for p in haystack}
+    return all(path_key(p) in haystack_keys for p in needles)
+
+
 class PathSet:
     def __init__(self, trace, _empty=False):
         self.trace = trace.copy()
@@ -160,18 +222,7 @@ class PathSet:
 
     @staticmethod
     def _paths_equal(path1, path2):
-        nodes1 = path1
-        nodes2 = path2
-        if len(nodes1) != len(nodes2):
-            return False
-        for node1, node2 in zip(nodes1, nodes2):
-            if node1.name != node2.name:
-                return False
-            if len(node1.choices) != 1 or len(node2.choices) != 1:
-                return False
-            if node1.choices[0] != node2.choices[0]:
-                return False
-        return True
+        return paths_equal(path1, path2)
 
     def __bool__(self):
         return len(self) > 0
@@ -183,7 +234,7 @@ class PathSet:
         return f'PathSet with {len(self)} possible paths from {len(self.trace)} trace nodes'
 
     def _path_to_tuple(self, path):
-        return tuple((node.name, node.choices[0]) for node in path)
+        return path_key(path)
 
     def _create_trace_from_paths(self, path_tuples):
         if not path_tuples:
